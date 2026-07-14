@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# reference docs (large, not needed for development)
+interview-qa-langgraph.md
+tutorial/

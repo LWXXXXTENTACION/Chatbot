@@ -1,0 +1,28 @@
+[project]
+name = "chatbot-backend"
+version = "0.1.0"
+description = "LangGraph Python backend for DeepSeek chatbot"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "langgraph>=0.4",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "httpx[socks]>=0.28",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "passlib[bcrypt]>=1.7",
+    "PyJWT>=2.9",
+    "ddgs>=9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "websockets>=12",
+]

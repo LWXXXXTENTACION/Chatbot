@@ -1,65 +1,101 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useMemo, useRef } from "react";
+import { Sidebar } from "@/components/Sidebar";
+import { ChatView } from "@/components/ChatView";
+import { ArtifactPanel } from "@/components/ArtifactPanel";
+import { AuthGuard } from "@/components/AuthGuard";
+import { useChatStore } from "@/lib/store";
+
+/** Maximum number of ChatViews to keep mounted simultaneously. */
+const KEEP_ALIVE_MAX = 5;
+
+export default function HomePage() {
+  const conversations = useChatStore((s) => s.conversations);
+  const activeId = useChatStore((s) => s.activeId);
+  const artifactOpen = useChatStore((s) => s.artifactOpen);
+  const streamingIds = useChatStore((s) => s.streamingIds);
+
+  // Auto-load messages for the active conversation on mount / switch.
+  // loadConversations() only fetches the list; individual messages are
+  // fetched lazily. Without this effect, the initial active conversation
+  // would show an empty ChatView even though messages exist in the DB.
+  const messagesLoadedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeId) return;
+    // Check the store directly (not the `conversations` state from this
+    // render) to avoid a dependency on the conversations array — which
+    // changes on every message sync and would re-trigger this effect.
+    const store = useChatStore.getState();
+    const conv = store.conversations.find((c) => c.id === activeId);
+    if (!conv || conv.messages.length > 0) return;
+    if (messagesLoadedRef.current.has(activeId)) return;
+    messagesLoadedRef.current.add(activeId);
+    store.loadMessages(activeId);
+  }, [activeId]);
+
+  // Keep-alive: maintain mounted ChatViews for the active conversation,
+  // any conversation with an in-flight stream, and the most recent
+  // conversations (up to KEEP_ALIVE_MAX total). Non-visible views are
+  // hidden with CSS `display:none` so their useChatStream hooks stay
+  // alive and continue processing SSE events in the background.
+  const keepAliveIds = useMemo(() => {
+    const ids = new Set<string>();
+
+    // Active conversation first
+    if (activeId) ids.add(activeId);
+
+    // All streaming conversations (may include non-active ones)
+    if (streamingIds) {
+      streamingIds.forEach((id) => ids.add(id));
+    }
+
+    // Fill remaining slots with most recent conversations
+    if (ids.size < KEEP_ALIVE_MAX) {
+      const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const c of sorted) {
+        if (ids.size >= KEEP_ALIVE_MAX) break;
+        ids.add(c.id);
+      }
+    }
+
+    return ids;
+  }, [activeId, streamingIds, conversations]);
+
+  const keepAliveConversations = conversations.filter((c) =>
+    keepAliveIds.has(c.id),
+  );
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+    <AuthGuard>
+      <main className="app-bg flex h-full">
+        <Sidebar />
+        <div className="flex h-full min-w-0 flex-1">
+          {keepAliveConversations.length > 0 ? (
+            keepAliveConversations.map((conv) => {
+              const isActive = conv.id === activeId;
+              return (
+                <div
+                  key={conv.id}
+                  className={
+                    isActive
+                      ? "flex h-full min-w-0 flex-1"
+                      : "hidden"
+                  }
+                  aria-hidden={!isActive}
+                >
+                  <ChatView conversation={conv} />
+                </div>
+              );
+            })
+          ) : (
+            <div className="flex h-full flex-1 items-center justify-center text-sm text-[var(--fg-muted)]">
+              暂无对话，请点击侧边栏新建
+            </div>
+          )}
+          {artifactOpen ? <ArtifactPanel /> : null}
         </div>
       </main>
-    </div>
+    </AuthGuard>
   );
 }

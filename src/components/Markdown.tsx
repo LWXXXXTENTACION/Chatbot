@@ -3,6 +3,7 @@
 import {
   isValidElement,
   memo,
+  useId,
   type ComponentPropsWithoutRef,
 } from "react";
 import ReactMarkdown from "react-markdown";
@@ -25,73 +26,130 @@ function Pre({ children }: ComponentPropsWithoutRef<"pre">) {
   let raw = "";
 
   if (isValidElement(children)) {
-    const codeProps = children.props as {
-      className?: string;
-      node?: unknown;
-    };
-    const match = /language-([\w-]+)/.exec(codeProps.className ?? "");
-    language = match?.[1];
+    const codeProps = children.props as { className?: string; node?: unknown };
+    language = /language-([\w-]+)/.exec(codeProps.className ?? "")?.[1];
     raw = hastToText(codeProps.node);
   }
 
+  return <CodeBlock language={language} raw={raw}>{children}</CodeBlock>;
+}
+
+function safeUrl(source?: Source): string | null {
+  if (!source?.url) return null;
+  try {
+    const url = new URL(source.url);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function sourceHost(source: Source): string {
+  try {
+    return new URL(source.url).hostname.replace(/^www\./, "");
+  } catch {
+    return source.title || "来源";
+  }
+}
+
+function citationMarkdown(text: string, sources: Source[]): string {
+  // Preferred model protocol: [[cite:1]] or [[cite:1,2]].
+  const explicit = text.replace(/\[\[cite:([\d,\s]+)\]\]/gi, (marker, raw) => {
+    const indexes = String(raw)
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10) - 1)
+      .filter((index, position, all) =>
+        index >= 0 &&
+        index < sources.length &&
+        Boolean(safeUrl(sources[index])) &&
+        all.indexOf(index) === position,
+      );
+    return indexes.length ? `[来源](#__citation__:${indexes.join(",")})` : marker;
+  });
+
+  // Keep old conversations using [1] compatible, without rewriting links.
+  return explicit.replace(/\[(\d+)\](?!\s*\()/g, (marker, number) => {
+    const index = Number.parseInt(number, 10) - 1;
+    return index >= 0 && index < sources.length && safeUrl(sources[index])
+      ? `[来源](#__citation__:${index})`
+      : marker;
+  });
+}
+
+function CitationItem({ index, source }: { index: number; source: Source }) {
+  const descriptionId = useId();
+  const href = safeUrl(source);
+  if (!href) return null;
+
   return (
-    <CodeBlock language={language} raw={raw}>
-      {children}
-    </CodeBlock>
+    <span className="citation-option-wrap">
+      <a
+        className="citation-option-link"
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label={`来源 ${index + 1}：${source.title}`}
+      >
+        <span
+          data-index={index + 1}
+          className="citation-option options-item-Yv7oFR"
+          aria-describedby={descriptionId}
+        >
+          {index + 1}
+        </span>
+      </a>
+      <span id={descriptionId} className="citation-tooltip" role="tooltip">
+        <strong>{source.title || `来源 ${index + 1}`}</strong>
+        <span>{sourceHost(source)}</span>
+      </span>
+    </span>
   );
 }
 
-function MarkdownImpl({
-  children,
-  sources,
-}: {
-  children: string;
-  sources?: Source[];
-}) {
-  // Pre-process: replace [1], [2] etc. with markdown citation links.
-  // Only transform when sources are available and the number has a match.
-  const processedText =
-    sources?.length
-      ? children.replace(/\[(\d+)\]/g, (_match, n) => {
-          const idx = parseInt(n) - 1;
-          if (idx >= 0 && idx < sources.length && sources[idx]?.url) {
-            return `[${n}](__citation__:${idx})`;
-          }
-          return _match; // keep as-is if no matching source
-        })
-      : children;
+function SourceSpanLink({ indexes, sources }: { indexes: number[]; sources: Source[] }) {
+  return (
+    <span className="source-span-link" aria-label="引用来源">
+      {indexes.map((index) => {
+        const source = sources[index];
+        return source ? (
+          <CitationItem key={`${index}-${source.url}`} index={index} source={source} />
+        ) : null;
+      })}
+    </span>
+  );
+}
+
+function sameSources(a?: Source[], b?: Source[]): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((source, index) =>
+    source.url === b[index].url &&
+    source.title === b[index].title &&
+    source.content === b[index].content,
+  );
+}
+
+function MarkdownImpl({ children, sources = [] }: { children: string; sources?: Source[] }) {
+  const processedText = sources.length ? citationMarkdown(children, sources) : children;
 
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[
-          [rehypeHighlight, { detect: true, ignoreMissing: true }],
-        ]}
+        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
         components={{
           pre: Pre,
           a: (props) => {
             const href = props.href || "";
-            // Custom citation links — render as superscript badges
-            if (href.startsWith("__citation__:")) {
-              const idx = parseInt(href.split(":")[1]);
-              const source = sources?.[idx];
-              return (
-                <sup className="citation-badge">
-                  <a
-                    href={source?.url || "#"}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    title={source?.title || ""}
-                  >
-                    [{idx + 1}]
-                  </a>
-                </sup>
-              );
+            if (href.startsWith("#__citation__:")) {
+              const indexes = href
+                .slice("#__citation__:".length)
+                .split(",")
+                .map((value) => Number.parseInt(value, 10))
+                .filter(Number.isInteger);
+              return <SourceSpanLink indexes={indexes} sources={sources} />;
             }
-            return (
-              <a {...props} target="_blank" rel="noopener noreferrer" />
-            );
+            return <a {...props} target="_blank" rel="noopener noreferrer" />;
           },
         }}
       >
@@ -101,11 +159,8 @@ function MarkdownImpl({
   );
 }
 
-// Memoized so streaming re-renders only reparse when text actually changes.
-export const Markdown = memo(MarkdownImpl, (a, b) => {
-  if (a.children !== b.children) return false;
-  const aLen = a.sources?.length ?? 0;
-  const bLen = b.sources?.length ?? 0;
-  if (aLen !== bLen) return false;
-  return JSON.stringify(a.sources) === JSON.stringify(b.sources);
-});
+export const Markdown = memo(
+  MarkdownImpl,
+  (previous, next) =>
+    previous.children === next.children && sameSources(previous.sources, next.sources),
+);

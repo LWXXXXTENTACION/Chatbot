@@ -7,7 +7,7 @@ import { ToolInvocation } from "./ToolInvocation";
 import { ArtifactCard } from "./ArtifactCard";
 import { SourcesFootnotes } from "./SourcesFootnotes";
 import { useChatStore } from "@/lib/store";
-import type { ChatUIMessage, ToolState } from "@/lib/types";
+import type { ChatUIMessage, Source, SourcesPart, ToolState } from "@/lib/types";
 
 interface MessageBubbleProps {
   message: ChatUIMessage;
@@ -20,7 +20,11 @@ type AnyPart = ChatUIMessage["parts"][number];
 export function MessageBubble({ message, isStreaming, conversationId }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
-  const messageSources = useChatStore((s) => s.messageSources[message.id]);
+  const storedSources = useChatStore((s) => s.messageSources[message.id]);
+  const persistedSources = (message.parts.find(
+    (part) => part.type === "sources",
+  ) as SourcesPart | undefined)?.sources;
+  const messageSources = storedSources || persistedSources;
 
   if (isUser) {
     const text = message.parts
@@ -85,7 +89,7 @@ function PartView({
   part: AnyPart;
   streaming?: boolean;
   conversationId?: string;
-  sources?: import("@/lib/types").Source[];
+  sources?: Source[];
 }) {
   if (part.type === "text") {
     const text = (part as { text: string }).text;
@@ -101,6 +105,8 @@ function PartView({
       <ReasoningBlock text={text} streaming={streaming && state === "streaming"} />
     );
   }
+
+  if (part.type === "sources") return null;
 
   if (part.type === "tool-create_artifact") {
     const p = part as {

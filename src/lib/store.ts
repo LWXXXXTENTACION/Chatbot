@@ -227,6 +227,10 @@ export const useChatStore = create<ChatState>()((set, get) => ({
           if (p.type === "reasoning") {
             return { type: "reasoning", text: p.text || "", state: "complete" as const };
           }
+          if (p.type === "sources") {
+            const output = p.tool_output as { results?: Source[] } | null;
+            return { type: "sources", sources: output?.results || [] };
+          }
           // Tool parts
           return {
             type: p.type,
@@ -240,13 +244,19 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         createdAt: new Date(m.created_at),
       }));
 
-      // Extract sources from persisted web_search tool outputs
+      // Extract sources persisted directly on each final answer. The tool
+      // fallback keeps older conversations readable.
       const sourcesMap: Record<string, Source[]> = {};
       (data.messages || []).forEach((m) => {
         const msgId = messages.find((msg) => msg.id === m.id)?.id;
         if (!msgId) return;
         (m.parts || []).forEach((p) => {
-          if (p.type === "tool-web_search" && p.tool_output) {
+          if (
+            (p.type === "sources" ||
+              p.type === "tool-deep_search" ||
+              p.type === "tool-web_search") &&
+            p.tool_output
+          ) {
             const output = p.tool_output as { results?: Source[] };
             if (output.results?.length) {
               sourcesMap[msgId] = output.results;

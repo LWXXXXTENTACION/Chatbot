@@ -55,6 +55,9 @@ app.include_router(auth_router)
 app.include_router(conversations_router)
 app.include_router(chat_router)
 
+# Reused by the unauthenticated compatibility endpoints below.
+_graph = build_graph()
+
 
 def _extract_text(msg: dict[str, Any]) -> str:
     """Extract text from a message dict, checking both content and parts fields."""
@@ -147,11 +150,16 @@ async def _run_graph_and_stream(
             "system_prompt": system_prompt,
             "user_id": "",
             "conversation_id": "",
-            "route_category": "",
-            "agent_outputs": {},
+            "source_citations": [],
+            "retrieved_docs": "",
+            "search_iteration": 0,
+            "search_history": [],
             "error": None,
         }
-        config = {"configurable": {"stream_callback": send_event}}
+        config = {
+            "configurable": {"stream_callback": send_event},
+            "recursion_limit": 12,
+        }
         await _graph.ainvoke(initial_state, config=config)  # type: ignore[arg-type]
         # Send done event after successful completion
         await send_event({"type": "done", "messageId": message_id})
@@ -260,10 +268,6 @@ async def chat_websocket(ws: WebSocket) -> None:
         system_prompt: str,
     ) -> None:
         await _run_graph_and_stream(raw_messages, model_id, system_prompt, send_event)
-
-        # Send done event (graph completed without error)
-        message_id = f"msg_{uuid.uuid4().hex[:12]}"
-        await send_event({"type": "done", "messageId": message_id})
 
     try:
         async for raw in ws.iter_text():

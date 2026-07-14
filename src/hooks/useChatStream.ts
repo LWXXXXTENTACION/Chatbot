@@ -12,7 +12,6 @@ import type {
   ToolPartBase,
   SSEActivity,
   SSEServerMessage,
-  Source,
 } from "@/lib/types";
 import { extractArtifactFields } from "@/lib/partial-json";
 import { useChatStore } from "@/lib/store";
@@ -193,10 +192,7 @@ export function useChatStream({
 
     switch (data.type) {
       case "text_start": {
-        // Finalize previous specialist's message when switching to a new one.
-        // Each specialist generates its own message with a unique ID;
-        // without this boundary, tool calls accumulate across specialists
-        // and the last message gets duplicates from all of them.
+        // A tool call and the final answer are separate main-agent messages.
         if (streamingMessageRef.current && streamingMessageRef.current.id !== data.messageId) {
           finalizeStreamingMessage();
         }
@@ -224,7 +220,7 @@ export function useChatStream({
         break;
 
       case "reasoning_start": {
-        // Specialist boundary: finalize previous message if messageId changed
+        // Finalize the preceding main-agent tool-call message when needed.
         if (streamingMessageRef.current && streamingMessageRef.current.id !== data.messageId) {
           finalizeStreamingMessage();
         }
@@ -256,7 +252,7 @@ export function useChatStream({
         break;
 
       case "tool_call_start": {
-        // Same specialist boundary check as text_start
+        // Same main-agent message boundary check as text_start.
         if (streamingMessageRef.current && streamingMessageRef.current.id !== data.messageId) {
           finalizeStreamingMessage();
         }
@@ -364,20 +360,14 @@ export function useChatStream({
             state: data.error ? "output-error" : "output-available",
           });
 
-          // Extract sources from web_search tool results
-          if (tc.type === "tool-web_search" && data.result) {
-            const result = data.result as Record<string, unknown>;
-            const results = result.results as Source[] | undefined;
-            if (results?.length && streamingMessageRef.current) {
-              useChatStore.getState().setMessageSources(
-                streamingMessageRef.current.id,
-                results,
-              );
-            }
-          }
-
           syncStreamingMessage();
         }
+        break;
+      }
+
+      case "sources": {
+        // The backend emits this only for the final answer message.
+        useChatStore.getState().setMessageSources(data.messageId, data.sources);
         break;
       }
 
@@ -395,8 +385,8 @@ export function useChatStream({
       case "done": {
         // Finalize whatever message is currently streaming.
         // The done event's messageId is from the graph runner, not the
-        // specialist node, so it won't match. But the current streaming
-        // message (from the specialist) was already synced during streaming
+        // main-agent node, so it won't match. The current streaming
+        // message was already synced during streaming
         // via syncStreamingMessage — we just need to reset the streaming
         // state so the hook is ready for the next message.
         finalizeStreamingMessage();

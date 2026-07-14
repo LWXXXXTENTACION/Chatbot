@@ -1,13 +1,14 @@
 # DeepSeek Chatbot
 
-一个对标 Claude.ai / Cursor 核心交互的 AI 聊天前端：流式 UI、工具调用可视化、Artifact 侧栏系统、代码高亮。基于 Next.js 16 + Vercel AI SDK 6 + Zustand + Tailwind v4。
+一个带 FastAPI + LangGraph 后端的 DeepSeek 聊天应用：流式 UI、工具调用可视化、独立深度搜索、行内来源链接和 Artifact 侧栏。前端基于 Next.js 16、React 19、Zustand 与 Tailwind v4。
 
 ## 功能
 
 - **多模型切换** — `deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-chat` (V3) / `deepseek-reasoner` (R1) 一键切换
-- **流式输出** — 基于 AI SDK 6 的增量 SSE 流式渲染，Markdown 边流边解析（memo 优化）
+- **流式输出** — 基于 POST SSE 的增量渲染，Markdown 边流边解析（memo 优化）
 - **推理过程可视化** — R1 等推理模型自动展示可折叠的「思考过程」，带 shimmer 动画
-- **工具调用可视化** — 内置 `getWeather` / `calculate` 工具，对话中实时展示「执行中 → 参数 → 结果」各状态（多步 `stepCountIs`）
+- **单主 Agent 工具调用** — 主 Agent 直接使用天气、计算与 Artifact；需要外部资料时只委派一次独立 `deep_search` Agent
+- **行内来源链接** — 重要结论后的 `[[cite:n]]` 自动显示为响应式来源 span link，并在会话重载后保留
 - **Artifact 侧栏系统** — 模型用 `createArtifact` 工具产出独立工件；侧栏边流式边渲染，HTML/SVG 可实时预览，代码可一键复制
 - **代码高亮** — `rehype-highlight` 语法高亮 + 语言标签 + 复制按钮，配色随明暗主题切换
 - **会话状态管理** — Zustand + persist 中间件，多会话历史保存在 `localStorage`
@@ -18,12 +19,12 @@
 
 | 能力 | 实现 |
 |---|---|
-| 流式渲染 | `useChat` + `streamText().toUIMessageStreamResponse()` |
+| 流式渲染 | `fetch` + `ReadableStream` 解析 POST SSE |
 | Markdown 增量解析 | `react-markdown` + `remark-gfm`，按内容 memo |
 | 代码块高亮 | `rehype-highlight` + 自定义 `CodeBlock`（语言标签/复制） |
-| 工具调用可视化 | `tool()` + zod 定义；`ToolInvocation` 渲染 UI part 各状态 |
+| 工具调用可视化 | LangGraph 工具节点；`ToolInvocation` 渲染各状态 |
 | Artifact 系统 | `createArtifact` 工具 → `ArtifactCard` + `ArtifactPanel`（预览/源码切换） |
-| 对话历史管理 | Zustand store + `persist` → `localStorage` |
+| 对话历史管理 | Zustand + FastAPI/SQLite 持久化 |
 
 ## 快速开始
 

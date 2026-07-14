@@ -202,6 +202,19 @@ async def _persist_messages(
                 ))
                 pos += 1
 
+            # Bind research sources to the final answer message so inline
+            # citations still resolve after a conversation is reloaded.
+            sources = lc_msg.additional_kwargs.get("sources")
+            if isinstance(sources, list) and sources:
+                parts.append(MessagePart(
+                    id=uuid.uuid4().hex,
+                    message_id=msg.id,
+                    type="sources",
+                    tool_output={"results": sources},
+                    position=pos,
+                ))
+                pos += 1
+
             # Tool calls
             if lc_msg.tool_calls:
                 for tc in lc_msg.tool_calls:
@@ -313,18 +326,11 @@ async def _run_graph_and_stream(
             "system_prompt": system_prompt,
             "user_id": user_id,
             "conversation_id": conversation_id,
-            "route_category": "",
-            "agent_outputs": {},
             "source_citations": [],
             "retrieved_docs": "",
             "search_iteration": 0,
             "search_history": [],
             "error": None,
-            # Supervisor fields — initialized for first iteration
-            "supervisor_action": "",
-            "supervisor_target": "",
-            "supervisor_task": "",
-            "supervisor_iteration": 0,
         }
         config = {
             "configurable": {
@@ -332,9 +338,8 @@ async def _run_graph_and_stream(
                 "user_id": user_id,
                 "conversation_id": conversation_id,
             },
-            # Supervisor loop: each iteration = supervisor→agent→tools→supervisor.
-            # Max 5 supervisor iterations × 4 steps ≈ 20, plus buffer.
-            "recursion_limit": 30,
+            # One main-agent/tool loop, with at most one deep-search delegation.
+            "recursion_limit": 12,
         }
         final_state = await graph.ainvoke(initial_state, config=config)  # type: ignore[arg-type]
         await send_event({"type": "done", "messageId": message_id})

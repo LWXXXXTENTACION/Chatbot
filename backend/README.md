@@ -35,12 +35,16 @@ WebSocket /ws
 main.py (FastAPI)
   ↓
 graph.ainvoke(state, config)
-  ├── chat_node (LLM call + streaming)
+  ├── main_agent (one LLM handles every user-facing task)
   │     └── emit: text_*, reasoning_*, tool_call_* events
   ├── routing (should_continue)
-  └── tool_node (execute tools)
-        └── emit: tool_result events
+  └── tools (weather / calculate / artifact / deep_search)
+        ├── direct tools run without another agent
+        └── deep_search_agent → parallel web_search → cited brief
 ```
+
+`deep_search` is capped at one delegation per user turn. Its numbered sources
+are attached to the final assistant message and streamed in a `sources` event.
 
 ## WebSocket Protocol
 
@@ -60,7 +64,7 @@ Connect to `ws://localhost:8000/ws`.
 {"type": "stop"}
 ```
 
-**Server events:** `text_start`, `text_delta`, `text_end`, `reasoning_start`, `reasoning_delta`, `reasoning_end`, `tool_call_start`, `tool_call_delta`, `tool_call_end`, `tool_result`, `done`, `error`, `pong`
+**Server events:** `text_start`, `text_delta`, `text_end`, `reasoning_start`, `reasoning_delta`, `reasoning_end`, `tool_call_start`, `tool_call_delta`, `tool_call_end`, `tool_result`, `sources`, `done`, `error`, `pong`
 
 ## Testing
 

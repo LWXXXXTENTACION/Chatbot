@@ -179,6 +179,12 @@ export interface SSEToolResult {
   error: string | null;
 }
 
+export interface SSESources {
+  type: "sources";
+  messageId: string;
+  sources: Source[];
+}
+
 export interface SSEDone {
   type: "done";
   messageId: string;
@@ -212,6 +218,7 @@ export type SSEServerMessage =
   | SSEToolCallDelta
   | SSEToolCallEnd
   | SSEToolResult
+  | SSESources
   | SSEDone
   | SSEError
   | SSEPong

@@ -209,31 +209,102 @@ body {
 }
 
 /* =========================================================
-   Citation badges & sources footnotes
+   Responsive inline source span links & source footnotes
    ========================================================= */
-.citation-badge a {
+.source-span-link {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  min-width: 1.15em;
-  height: 1.15em;
-  padding: 0 0.18em;
-  font-size: 0.72em;
-  font-weight: 600;
+  gap: 0.14rem;
+  margin-inline: 0.18rem 0.05rem;
+  white-space: nowrap;
+  vertical-align: 0.08em;
+}
+.citation-option-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.markdown a.citation-option-link {
+  display: inline-flex;
+  border: 0;
+  border-radius: 0.3rem;
+  text-decoration: none;
+  outline: none;
+}
+.citation-option {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.16rem;
+  height: 1.16rem;
+  padding-inline: 0.22rem;
+  font-size: 0.66rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   color: var(--accent);
   background: var(--accent-soft);
   border: 1px solid color-mix(in oklab, var(--accent) 25%, transparent);
-  border-radius: 3px;
-  vertical-align: super;
-  text-decoration: none;
-  transition: all 0.15s ease;
+  border-radius: 0.28rem;
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--accent) 10%, transparent);
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
   cursor: pointer;
 }
-.citation-badge a:hover {
-  background: var(--accent);
+.citation-option-wrap:hover .citation-option,
+.citation-option-link:focus-visible .citation-option {
   color: #fff;
+  background: var(--accent);
   border-color: var(--accent);
+  transform: translateY(-1px);
+}
+.citation-option-link:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 20%, transparent);
+}
+.citation-tooltip {
+  position: absolute;
+  z-index: 40;
+  left: 50%;
+  bottom: calc(100% + 0.48rem);
+  display: grid;
+  gap: 0.2rem;
+  width: max-content;
+  max-width: min(18rem, calc(100vw - 2rem));
+  padding: 0.58rem 0.68rem;
+  color: var(--fg);
+  background: color-mix(in oklab, var(--bg-elev) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, 0.25rem);
+  transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease;
+  backdrop-filter: blur(12px);
+}
+.citation-tooltip strong {
+  overflow: hidden;
+  font-size: 0.76rem;
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.citation-tooltip > span {
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.citation-option-wrap:hover .citation-tooltip,
+.citation-option-wrap:focus-within .citation-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0);
 }
 
 .sources-footnotes {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, ChevronDown, Sparkles } from "lucide-react";
+import { Check, ChevronDown, Cpu } from "lucide-react";
 import {
   DEEPSEEK_MODELS,
   type DeepSeekModelId,
@@ -43,7 +43,7 @@ export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps)
         onClick={() => setOpen((v) => !v)}
         className="focus-ring group flex items-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-elev)] px-3 py-1.5 text-[13px] font-medium text-[var(--fg)] shadow-[var(--shadow-sm)] transition-all hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-md)] disabled:cursor-not-allowed disabled:opacity-50"
       >
-        <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+        <Cpu className="h-3.5 w-3.5 text-[var(--accent)]" />
         <span className="font-semibold tracking-tight">{current.name}</span>
         {current.badge ? (
           <span className="rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-strong)]">
@@ -107,7 +107,7 @@ export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps)
                   </p>
                 </div>
                 {selected ? (
-                  <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white shadow-[0_2px_6px_-2px_rgba(99,102,241,0.6)]">
+                  <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white shadow-[var(--shadow-sm)]">
                     <Check className="h-3 w-3" strokeWidth={3} />
                   </div>
                 ) : null}

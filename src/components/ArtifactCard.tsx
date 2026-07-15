@@ -103,7 +103,7 @@ export function ArtifactCard({ toolCallId, state, input, conversationId }: Artif
       onClick={() => openArtifact(conversationId, artifact)}
       className="group flex w-full items-center gap-3 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-elev)] px-3.5 py-3 text-left shadow-[var(--shadow-sm)] transition-all hover:-translate-y-[1px] hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-md)]"
     >
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow-[0_4px_14px_-4px_rgba(99,102,241,0.5)]">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--border-strong)] bg-[var(--accent-soft)] text-[var(--accent-strong)]">
         <Icon className="h-5 w-5" strokeWidth={2.1} />
       </div>
       <div className="min-w-0 flex-1">

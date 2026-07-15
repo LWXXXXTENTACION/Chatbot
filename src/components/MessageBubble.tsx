@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Brain, ChevronDown, Sparkles } from "lucide-react";
+import { Brain, ChevronDown, MessageCircle } from "lucide-react";
 import { Markdown } from "./Markdown";
 import { ToolInvocation } from "./ToolInvocation";
 import { ArtifactCard } from "./ArtifactCard";
@@ -56,8 +56,8 @@ export function MessageBubble({ message, isStreaming, conversationId }: MessageB
 
   return (
     <div className="fade-in-up flex justify-start gap-3" data-role="assistant">
-      <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow-[0_4px_14px_-4px_rgba(99,102,241,0.55)]">
-        <Sparkles className="h-4 w-4" strokeWidth={2.4} />
+      <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border-strong)] bg-[var(--accent-soft)] text-[var(--accent-strong)]">
+        <MessageCircle className="h-4 w-4" strokeWidth={2.1} />
       </div>
 
       <div className="flex min-w-0 max-w-[82%] flex-1 flex-col gap-2.5">

@@ -6,8 +6,8 @@ import {
   Code2,
   Compass,
   Lightbulb,
+  MessageSquareText,
   PencilLine,
-  Sparkles,
 } from "lucide-react";
 import { ModelSelector } from "./ModelSelector";
 import { MessageBubble } from "./MessageBubble";
@@ -215,40 +215,15 @@ export function ChatView({ conversation }: ChatViewProps) {
 function EmptyState({ onPick }: { onPick: (text: string) => void }) {
   return (
     <div className="relative flex flex-1 flex-col items-center justify-center pt-10 pb-6 text-center">
-      {/* Animated orbs */}
-      <div
-        className="orb"
-        style={{
-          width: 220,
-          height: 220,
-          top: -40,
-          left: "calc(50% - 200px)",
-          background:
-            "radial-gradient(closest-side, var(--orb-a), transparent)",
-        }}
-      />
-      <div
-        className="orb"
-        style={{
-          width: 200,
-          height: 200,
-          top: 0,
-          left: "calc(50% + 20px)",
-          animationDelay: "-2s",
-          background:
-            "radial-gradient(closest-side, var(--orb-b), transparent)",
-        }}
-      />
-
-      <div className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow-[0_12px_36px_-8px_rgba(99,102,241,0.55)]">
-        <Sparkles className="h-6 w-6" strokeWidth={2.2} />
+      <div className="relative flex h-14 w-14 items-center justify-center rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elev)] text-[var(--accent-strong)] shadow-[var(--shadow-sm)]">
+        <MessageSquareText className="h-6 w-6" strokeWidth={1.9} />
       </div>
 
-      <h1 className="mt-6 bg-gradient-to-br from-[var(--fg)] to-[var(--fg-muted)] bg-clip-text text-[28px] font-semibold tracking-tight text-transparent">
-        有什么可以帮你的吗？
+      <h1 className="mt-6 text-[28px] font-semibold tracking-tight text-[var(--fg)]">
+        从一个问题开始
       </h1>
       <p className="mt-2 max-w-md text-[13.5px] text-[var(--fg-muted)]">
-        选择一个 DeepSeek 模型，开始对话。你可以在顶部随时切换模型。
+        直接输入问题，或从下面选择一个起点。模型可以随时在顶部切换。
       </p>
 
       <div className="mt-10 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
@@ -256,7 +231,7 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
           <button
             key={title}
             onClick={() => onPick(prompt)}
-            className="focus-ring group relative flex items-start gap-3 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-elev)] px-4 py-3.5 text-left shadow-[var(--shadow-sm)] transition-all hover:-translate-y-[1px] hover:border-[var(--border-strong)] hover:shadow-[var(--shadow-md)]"
+            className="focus-ring group relative flex items-start gap-3 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-elev)] px-4 py-3.5 text-left shadow-[var(--shadow-sm)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]"
           >
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-strong)] transition-colors group-hover:bg-[var(--accent)] group-hover:text-white">
               <Icon className="h-4 w-4" strokeWidth={2.2} />

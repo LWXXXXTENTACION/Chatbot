@@ -12,10 +12,14 @@ export function ArtifactPanel() {
   const [copied, setCopied] = useState(false);
 
   const canPreview = artifact?.kind === "html" || artifact?.kind === "svg";
-  const effectiveTab = canPreview ? tab : "code";
+  // Streaming HTML changes on nearly every tool-call delta. Mounting it in an
+  // iframe at that point reloads srcDoc repeatedly and causes visible flashing.
+  // Keep showing source while content is incomplete, then mount preview once.
+  const previewReady = canPreview && !artifact?.streaming;
+  const effectiveTab = previewReady ? tab : "code";
 
   const previewDoc = useMemo(() => {
-    if (!artifact) return "";
+    if (!artifact || artifact.streaming) return "";
     if (artifact.kind === "svg") {
       return `<!doctype html><html><head><meta charset="utf-8"><style>
         html,body{margin:0;height:100%;display:grid;place-items:center;background:#fff}
@@ -75,6 +79,7 @@ export function ArtifactPanel() {
               onClick={() => setTab("preview")}
               icon={Eye}
               label="预览"
+              disabled={!previewReady}
             />
             <TabButton
               active={effectiveTab === "code"}
@@ -132,20 +137,25 @@ function TabButton({
   onClick,
   icon: Icon,
   label,
+  disabled,
 }: {
   active: boolean;
   onClick: () => void;
   icon: typeof Eye;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
+      disabled={disabled}
+      title={disabled ? "生成完成后可预览" : undefined}
       className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors ${
         active
           ? "bg-[var(--bg-elev)] text-[var(--fg)] shadow-[var(--shadow-sm)]"
           : "text-[var(--fg-muted)] hover:text-[var(--fg)]"
-      }`}
+      } disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-[var(--fg-muted)]`}
     >
       <Icon className="h-3.5 w-3.5" />
       {label}

@@ -3,27 +3,6 @@ import { DEFAULT_MODEL, type DeepSeekModelId } from "./models";
 import type { Artifact, ChatUIMessage, Conversation, Source } from "./types";
 import { api } from "./api";
 
-// ---- Helpers ----
-
-function generateId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function newConversation(model: DeepSeekModelId = DEFAULT_MODEL): Conversation {
-  const now = Date.now();
-  return {
-    id: generateId(),
-    title: "新对话",
-    model,
-    messages: [],
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
 // ---- Store Interface ----
 
 interface ChatState {
@@ -93,23 +72,26 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   loadConversations: async () => {
     // Guard: don't call API without auth token (prevents 401 loops)
     if (typeof window !== "undefined" && !localStorage.getItem("chatbot.access_token")) {
-      // Create a local-only fallback conversation so the UI isn't empty
-      const fresh = newConversation();
-      set({ conversations: [fresh], activeId: fresh.id, isLoading: false });
+      set({ conversations: [], activeId: null, isLoading: false });
       return;
     }
 
     set({ isLoading: true });
     try {
       const data = await api.listConversations();
-      const conversations: Conversation[] = data.map((c) => ({
-        id: c.id,
-        title: c.title,
-        model: c.model as DeepSeekModelId,
-        messages: [],
-        createdAt: new Date(c.created_at).getTime(),
-        updatedAt: new Date(c.updated_at).getTime(),
-      }));
+      const conversations: Conversation[] = data
+        .map((c) => ({
+          id: c.id,
+          title: c.title,
+          model: c.model as DeepSeekModelId,
+          messages: [],
+          createdAt: new Date(c.created_at).getTime(),
+          updatedAt: new Date(c.updated_at).getTime(),
+        }))
+        .sort(
+          (a, b) =>
+            b.updatedAt - a.updatedAt || b.createdAt - a.createdAt,
+        );
 
       set((s) => {
         // Keep existing messages in memory when possible
@@ -136,19 +118,8 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         };
       });
     } catch {
-      // If API fails (e.g., no auth), keep local state
-      set((s) => {
-        if (s.conversations.length === 0) {
-          const fresh = newConversation();
-          return {
-            conversations: [fresh],
-            activeId: fresh.id,
-            hydrated: true,
-            isLoading: false,
-          };
-        }
-        return { hydrated: true, isLoading: false };
-      });
+      // A failed API request must never create a local-only conversation.
+      set({ hydrated: true, isLoading: false });
     }
   },
 
@@ -167,25 +138,22 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         updatedAt: new Date(data.updated_at).getTime(),
       };
       set((s) => ({
-        conversations: [conv, ...s.conversations],
+        conversations: [conv, ...s.conversations.filter((c) => c.id !== conv.id)],
         activeId: conv.id,
         artifactOpen: false,
       }));
       return conv;
     } catch {
-      // Fallback: create locally
-      const conv = newConversation(model);
-      set((s) => ({
-        conversations: [conv, ...s.conversations],
-        activeId: conv.id,
-        artifactOpen: false,
-      }));
-      return conv;
+      return null;
     }
   },
 
   selectConversation: (id) =>
-    set({ activeId: id, artifactOpen: false }),
+    set((s) =>
+      s.conversations.some((c) => c.id === id)
+        ? { activeId: id, artifactOpen: false }
+        : s,
+    ),
 
   deleteConversation: async (id) => {
     try {
@@ -198,10 +166,9 @@ export const useChatStore = create<ChatState>()((set, get) => ({
       // Clean up artifact for deleted conversation
       const { [id]: _, ...remaining } = s.artifacts;
       if (next.length === 0) {
-        const fresh = newConversation();
         return {
-          conversations: [fresh],
-          activeId: fresh.id,
+          conversations: [],
+          activeId: null,
           artifacts: {},
           artifactOpen: false,
         };

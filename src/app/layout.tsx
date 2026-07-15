@@ -1,7 +1,20 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import { Geist, Geist_Mono } from "next/font/google";
 import { AuthProvider } from "@/providers/AuthProvider";
 import "./globals.css";
+
+const THEME_SCRIPT = `(() => {
+  let saved = null;
+  try {
+    saved = localStorage.getItem("chatbot.theme");
+  } catch {}
+  const theme = saved === "light" || saved === "dark"
+    ? saved
+    : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+})();`;
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -27,8 +40,12 @@ export default function RootLayout({
     <html
       lang="zh-CN"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
-      <body className="h-full" suppressHydrationWarning>
+      <body className="h-full">
+        <Script id="theme-init" strategy="beforeInteractive">
+          {THEME_SCRIPT}
+        </Script>
         <AuthProvider>{children}</AuthProvider>
       </body>
     </html>

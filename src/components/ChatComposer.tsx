@@ -29,14 +29,14 @@ const SEARCH_OPTIONS: Array<{
     label: "联网搜索",
     hint: "快速搜索网页并附上来源",
     icon: Globe2,
-    activeClass: "border-cyan-500/35 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
+    activeClass: "border-[var(--accent)]/35 bg-[var(--accent-soft)] text-[var(--accent-strong)]",
   },
   {
     mode: "deep",
     label: "深度搜索",
     hint: "多方向检索、整理证据并附上引用",
     icon: Telescope,
-    activeClass: "border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300",
+    activeClass: "border-[var(--signal)]/35 bg-[var(--signal-soft)] text-[var(--signal)]",
   },
 ];
 
@@ -129,7 +129,7 @@ export function ChatComposer({
             <button
               type="submit"
               disabled={busy || !value.trim() || disabled}
-              className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white shadow-[0_6px_18px_-4px_rgba(99,102,241,0.5)] transition-all hover:shadow-[0_8px_22px_-4px_rgba(99,102,241,0.6)] active:scale-[0.97] disabled:cursor-not-allowed disabled:from-[var(--bg-subtle)] disabled:to-[var(--bg-subtle)] disabled:text-[var(--fg-subtle)] disabled:shadow-none"
+              className="focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-white shadow-[var(--shadow-sm)] transition-all hover:bg-[var(--accent-strong)] active:scale-[0.97] disabled:cursor-not-allowed disabled:bg-[var(--bg-subtle)] disabled:text-[var(--fg-subtle)] disabled:shadow-none"
               aria-label="发送"
             >
               <ArrowUp className="h-4 w-4" strokeWidth={2.6} />

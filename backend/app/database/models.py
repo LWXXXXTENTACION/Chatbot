@@ -44,7 +44,6 @@ class User(Base):
     password_hash = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_now, nullable=False)
     updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
-
     conversations = relationship(
         "Conversation", back_populates="user", cascade="all, delete-orphan"
     )
@@ -61,15 +60,26 @@ class Conversation(Base):
     model = Column(String(32), default="deepseek-v4-flash", nullable=False)
     created_at = Column(DateTime, default=_now, nullable=False)
     updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
+    message_sequence = Column(Integer, default=0, nullable=False)
 
     user = relationship("User", back_populates="conversations")
     messages = relationship(
-        "Message", back_populates="conversation", cascade="all, delete-orphan"
+        "Message",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="Message.sequence",
     )
 
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "sequence",
+            name="uq_messages_conversation_sequence",
+        ),
+    )
 
     id = Column(String(32), primary_key=True, default=_uuid)
     conversation_id = Column(
@@ -79,6 +89,7 @@ class Message(Base):
         index=True,
     )
     role = Column(String(16), nullable=False)  # "user" | "assistant" | "system" | "tool"
+    sequence = Column(Integer, nullable=False)
     created_at = Column(DateTime, default=_now, nullable=False)
 
     conversation = relationship("Conversation", back_populates="messages")

@@ -48,3 +48,7 @@ export function getModel(id: string): DeepSeekModel {
     DEEPSEEK_MODELS.find((m) => m.id === id) ?? DEEPSEEK_MODELS[0]
   );
 }
+
+export function modelSupportsTools(id: DeepSeekModelId): boolean {
+  return id !== "deepseek-reasoner";
+}

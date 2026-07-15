@@ -13,9 +13,9 @@ import { ModelSelector } from "./ModelSelector";
 import { MessageBubble } from "./MessageBubble";
 import { ChatComposer } from "./ChatComposer";
 import { ActivityTimeline } from "./ActivityTimeline";
-import type { DeepSeekModelId } from "@/lib/models";
+import { modelSupportsTools, type DeepSeekModelId } from "@/lib/models";
 import { useChatStore } from "@/lib/store";
-import type { Conversation } from "@/lib/types";
+import type { Conversation, SearchMode } from "@/lib/types";
 import { useChatStream } from "@/hooks/useChatStream";
 
 interface ChatViewProps {
@@ -53,6 +53,7 @@ export function ChatView({ conversation }: ChatViewProps) {
 
   const [input, setInput] = useState("");
   const [model, setModel] = useState<DeepSeekModelId>(conversation.model);
+  const [searchMode, setSearchMode] = useState<SearchMode>("auto");
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -69,6 +70,10 @@ export function ChatView({ conversation }: ChatViewProps) {
   useEffect(() => {
     setModel(conversation.model);
   }, [conversation.id, conversation.model]);
+
+  useEffect(() => {
+    setSearchMode("auto");
+  }, [conversation.id]);
 
   // Persist latest messages to store on unmount so no data is lost
   // when switching conversations mid-stream.
@@ -108,12 +113,15 @@ export function ChatView({ conversation }: ChatViewProps) {
   function handleSend(textOverride?: string) {
     const text = (textOverride ?? input).trim();
     if (!text || busy) return;
-    sendMessage({ text }, { body: { model } });
+    sendMessage({ text }, { body: { model, searchMode } });
     setInput("");
   }
 
   function handleModelChange(next: DeepSeekModelId) {
     setModel(next);
+    if (!modelSupportsTools(next)) {
+      setSearchMode("auto");
+    }
     setStoreModel(conversation.id, next);
   }
 
@@ -194,6 +202,9 @@ export function ChatView({ conversation }: ChatViewProps) {
             onSubmit={() => handleSend()}
             onStop={stop}
             status={status}
+            searchMode={searchMode}
+            onSearchModeChange={setSearchMode}
+            searchDisabled={!modelSupportsTools(model)}
           />
         </div>
       </div>

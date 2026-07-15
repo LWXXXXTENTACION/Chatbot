@@ -15,6 +15,10 @@ DEEPSEEK_INSECURE_TLS = os.getenv("DEEPSEEK_INSECURE_TLS", "0") == "1"
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "sqlite+aiosqlite:///./chatbot.db"
 )
+CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./checkpoints.db")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_ENABLED = os.getenv("REDIS_ENABLED", "1").lower() not in {"0", "false", "no"}
+AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "1").lower() not in {"0", "false", "no"}
 
 # JWT
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-in-production")

@@ -29,13 +29,20 @@ from app.config import (
     DeepSeekModelId,
     validate_model,
 )
-from app.database.engine import get_db
-from app.database.models import Conversation, Message, MessagePart, User
+from app.database.engine import async_session, get_db
+from app.database.messages import (
+    db_message_to_langchain,
+    persist_graph_messages,
+    persist_user_message,
+)
+from app.database.models import Conversation, Message, User
 from app.graph.builder import build_graph
+from app.graph.context import AgentRuntimeContext, SearchMode
 from app.graph.state import AgentState
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limit import check_rate_limit
 from app.schemas.chat import ChatRequest
+from app.streaming import stream_sse_events
 
 logger = logging.getLogger("chatbot.chat")
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -100,6 +107,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
             if parts and isinstance(parts, list):
                 text_parts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
+                tool_results: list[ToolMessage] = []
                 for part in parts:
                     part_type = part.get("type", "")
                     if part_type == "text":
@@ -117,7 +125,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
                             "type": "tool_call",
                         })
                         if part.get("state") == "output-available" and part.get("output"):
-                            result.append(ToolMessage(
+                            tool_results.append(ToolMessage(
                                 content=json.dumps(part["output"], ensure_ascii=False),
                                 tool_call_id=tool_call_id,
                             ))
@@ -125,6 +133,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
                 if tool_calls:
                     ai_msg.tool_calls = tool_calls  # type: ignore[assignment]
                 result.append(ai_msg)
+                result.extend(tool_results)
             else:
                 text = str(content) if isinstance(content, str) else ""
                 if isinstance(content, list):
@@ -139,225 +148,55 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
     return result
 
 
-# ——— Database persistence ———
-
-
-async def _persist_messages(
-    db: AsyncSession,
-    conversation_id: str,
-    new_lc_messages: list[BaseMessage],
-) -> None:
-    """Persist new assistant/tool messages to the database."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-
-    for lc_msg in new_lc_messages:
-        if isinstance(lc_msg, (SystemMessage,)):
-            continue  # Don't persist system messages
-
-        role = "user"
-        if isinstance(lc_msg, HumanMessage):
-            role = "user"
-        elif isinstance(lc_msg, AIMessage):
-            role = "assistant"
-        elif isinstance(lc_msg, ToolMessage):
-            role = "tool"
-        else:
-            continue
-
-        msg = Message(
-            id=uuid.uuid4().hex,
-            conversation_id=conversation_id,
-            role=role,
-            created_at=now,
-        )
-        db.add(msg)
-
-        # Create message parts
-        parts: list[MessagePart] = []
-        pos = 0
-
-        if isinstance(lc_msg, AIMessage):
-            # Text content
-            text = lc_msg.content
-            if isinstance(text, str) and text.strip():
-                parts.append(MessagePart(
-                    id=uuid.uuid4().hex,
-                    message_id=msg.id,
-                    type="text",
-                    text=text,
-                    position=pos,
-                ))
-                pos += 1
-
-            # Reasoning
-            reasoning = lc_msg.additional_kwargs.get("reasoning_content")
-            if reasoning and isinstance(reasoning, str) and reasoning.strip():
-                parts.append(MessagePart(
-                    id=uuid.uuid4().hex,
-                    message_id=msg.id,
-                    type="reasoning",
-                    text=reasoning,
-                    position=pos,
-                ))
-                pos += 1
-
-            # Bind research sources to the final answer message so inline
-            # citations still resolve after a conversation is reloaded.
-            sources = lc_msg.additional_kwargs.get("sources")
-            if isinstance(sources, list) and sources:
-                parts.append(MessagePart(
-                    id=uuid.uuid4().hex,
-                    message_id=msg.id,
-                    type="sources",
-                    tool_output={"results": sources},
-                    position=pos,
-                ))
-                pos += 1
-
-            # Tool calls
-            if lc_msg.tool_calls:
-                for tc in lc_msg.tool_calls:
-                    tc_id = tc.get("id", "")
-                    tc_name = tc.get("name", "")
-                    tc_args = tc.get("args", {})
-                    parts.append(MessagePart(
-                        id=uuid.uuid4().hex,
-                        message_id=msg.id,
-                        type=f"tool-{tc_name}",
-                        tool_call_id=tc_id,
-                        tool_state="input-available",
-                        tool_input=tc_args,
-                        position=pos,
-                    ))
-                    pos += 1
-
-        elif isinstance(lc_msg, HumanMessage):
-            text = lc_msg.content
-            if isinstance(text, str) and text.strip():
-                parts.append(MessagePart(
-                    id=uuid.uuid4().hex,
-                    message_id=msg.id,
-                    type="text",
-                    text=text,
-                    position=pos,
-                ))
-                pos += 1
-            elif isinstance(text, list):
-                for item in text:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        parts.append(MessagePart(
-                            id=uuid.uuid4().hex,
-                            message_id=msg.id,
-                            type="text",
-                            text=item.get("text", ""),
-                            position=pos,
-                        ))
-                        pos += 1
-
-        for part in parts:
-            db.add(part)
-
-    # Update tool outputs from ToolMessages — for tools like web_search
-    # that return structured results (urls, snippets), persist the output
-    # on the corresponding AIMessage's tool-call part so it survives reload.
-    for lc_msg in new_lc_messages:
-        if isinstance(lc_msg, ToolMessage):
-            tool_call_id = lc_msg.tool_call_id
-            if not tool_call_id:
-                continue
-            result = await db.execute(
-                select(MessagePart).where(
-                    MessagePart.tool_call_id == tool_call_id,
-                    MessagePart.message.has(
-                        Message.conversation_id == conversation_id
-                    ),
-                )
-            )
-            part = result.scalar_one_or_none()
-            if part:
-                try:
-                    output = (
-                        json.loads(lc_msg.content)
-                        if isinstance(lc_msg.content, str)
-                        else lc_msg.content
-                    )
-                except (json.JSONDecodeError, TypeError):
-                    output = lc_msg.content
-                part.tool_output = output
-                part.tool_state = "output-available"
-                db.add(part)
-
-    # Update conversation updated_at
-    result = await db.execute(
-        select(Conversation).where(Conversation.id == conversation_id)
-    )
-    conv = result.scalar_one_or_none()
-    if conv:
-        conv.updated_at = now
-
-    await db.commit()
-
-
 # ——— Graph runner ———
 
 
 async def _run_graph_and_stream(
-    lc_messages: list[BaseMessage],
+    graph: Any,
+    input_messages: list[BaseMessage],
+    new_user_message_id: str | None,
     model_id: DeepSeekModelId,
     system_prompt: str,
     send_event: Any,
     user_id: str,
     conversation_id: str,
+    tool_cache: Any | None,
+    search_mode: SearchMode,
 ) -> list[BaseMessage]:
-    """Run the LangGraph agent and emit events via the callback.
+    """Run one graph turn and return messages created after the new user input."""
+    initial_state: AgentState = {
+        "messages": input_messages,
+        "model_id": model_id,
+        "system_prompt": system_prompt,
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "source_citations": [],
+        "retrieved_docs": "",
+        "search_iteration": 0,
+        "search_history": [],
+        "error": None,
+    }
+    config: dict[str, Any] = {"recursion_limit": 12}
+    if conversation_id:
+        config["configurable"] = {"thread_id": conversation_id}
+    final_state = await graph.ainvoke(
+        initial_state,
+        config=config,
+        context=AgentRuntimeContext(
+            stream_callback=send_event,
+            tool_cache=tool_cache,
+            search_mode=search_mode,
+        ),
+    )
+    if final_state.get("error"):
+        raise RuntimeError(str(final_state["error"]))
 
-    Returns the new messages added by the graph (assistant + tool messages)
-    so the caller can persist them to the database.
-    """
-    graph = build_graph()
-    message_id = f"msg_{uuid.uuid4().hex[:12]}"
-    initial_msg_count = len(lc_messages)
-
-    try:
-        initial_state: AgentState = {
-            "messages": lc_messages,
-            "model_id": model_id,
-            "system_prompt": system_prompt,
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "source_citations": [],
-            "retrieved_docs": "",
-            "search_iteration": 0,
-            "search_history": [],
-            "error": None,
-        }
-        config = {
-            "configurable": {
-                "stream_callback": send_event,
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-            },
-            # One main-agent/tool loop, with at most one deep-search delegation.
-            "recursion_limit": 12,
-        }
-        final_state = await graph.ainvoke(initial_state, config=config)  # type: ignore[arg-type]
-        await send_event({"type": "done", "messageId": message_id})
-
-        # Return only the new messages added by the graph
-        all_messages: list[BaseMessage] = final_state.get("messages", [])
-        return all_messages[initial_msg_count:]
-    except asyncio.CancelledError:
-        logger.info("Graph run cancelled")
-        return []
-    except Exception as e:
-        logger.exception("Graph stream error")
-        await send_event({
-            "type": "error",
-            "message": f"调用 DeepSeek API 时发生错误: {str(e)}",
-            "code": "STREAM_ERROR",
-        })
-        return []
+    all_messages: list[BaseMessage] = final_state.get("messages", [])
+    if new_user_message_id:
+        for index, message in enumerate(all_messages):
+            if str(message.id or "") == new_user_message_id:
+                return all_messages[index + 1:]
+    return all_messages[len(input_messages):]
 
 
 # ——— SSE Endpoint ———
@@ -385,9 +224,10 @@ async def chat_stream(
     model_id = validate_model(body.model or DEFAULT_MODEL)
     system = body.system or DEFAULT_SYSTEM_PROMPT
 
-    # Determine messages to send
-    lc_messages: list[BaseMessage] = []
-    new_user_msg: BaseMessage | None = None
+    input_messages: list[BaseMessage] = []
+    new_user_msg: HumanMessage | None = None
+    conversation_id = body.conversation_id or ""
+    graph = build_graph()
 
     if body.conversation_id and body.new_message:
         # New mode: load history from DB, append new message
@@ -409,9 +249,9 @@ async def chat_stream(
                 media_type="application/json",
             )
 
-        # Convert stored messages to LangChain format
+        history: list[BaseMessage] = []
         for msg in conv.messages or []:
-            lc_messages.extend(_db_message_to_lc(msg))
+            history.extend(db_message_to_langchain(msg))
 
         # Add new user message
         nm = body.new_message
@@ -420,15 +260,35 @@ async def chat_stream(
             for p in nm.parts:
                 if isinstance(p, dict) and p.get("type") == "text":
                     user_text += p.get("text", "")
-        new_user_msg = HumanMessage(content=user_text)
-        lc_messages.append(new_user_msg)
+        new_user_msg = HumanMessage(content=user_text, id=uuid.uuid4().hex)
 
-        # Persist user message
-        await _persist_single_message(db, body.conversation_id, new_user_msg)
+        graph = request.app.state.graph
+        checkpoint_config = {"configurable": {"thread_id": conversation_id}}
+        snapshot = await graph.aget_state(checkpoint_config)
+        checkpoint_messages = (
+            snapshot.values.get("messages", []) if snapshot.values else []
+        )
+        checkpoint_synced = bool(snapshot.values) and (
+            (not history and not checkpoint_messages)
+            or (
+                bool(history)
+                and bool(checkpoint_messages)
+                and str(history[-1].id or "") == str(checkpoint_messages[-1].id or "")
+            )
+        )
+        if snapshot.values and not checkpoint_synced:
+            await request.app.state.checkpointer.adelete_thread(conversation_id)
+        input_messages = (
+            [new_user_msg]
+            if checkpoint_synced
+            else [*history, new_user_msg]
+        )
+
+        await persist_user_message(db, conversation_id, new_user_msg)
 
     elif body.messages:
         # Legacy mode: full history from client
-        lc_messages = _convert_messages(body.messages)
+        input_messages = _convert_messages(body.messages)
     else:
         return Response(
             content=json.dumps({"error": "缺少对话内容"}),
@@ -438,163 +298,66 @@ async def chat_stream(
 
     # SSE streaming setup
     event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    stop = False
 
     async def send_event(event: dict[str, Any]) -> None:
-        nonlocal stop
         await event_queue.put(event)
-        if event.get("type") in ("done", "error"):
-            stop = True
 
-    graph_task = asyncio.create_task(
-        _run_graph_and_stream(
-            lc_messages,
-            model_id,
-            system,
-            send_event,
-            str(current_user.id),
-            body.conversation_id or "",
-        )
-    )
+    checkpointer = getattr(request.app.state, "checkpointer", None)
+    tool_cache = getattr(request.app.state, "tool_cache", None)
 
-    async def sse_generator():
-        nonlocal stop
-        collected_messages: list[BaseMessage] = []
+    async def invalidate_checkpoint() -> None:
+        if checkpointer is not None and conversation_id:
+            try:
+                await checkpointer.adelete_thread(conversation_id)
+            except Exception:
+                logger.exception("Failed to invalidate checkpoint for %s", conversation_id)
 
+    async def run_and_persist() -> None:
         try:
-            while not stop:
-                try:
-                    event = await asyncio.wait_for(event_queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    yield b": keepalive\n\n"
-                    continue
-                except asyncio.CancelledError:
-                    # Client disconnected (e.g. tab closed, page navigated away)
-                    break
-                if event is None:
-                    break
+            new_messages = await _run_graph_and_stream(
+                graph,
+                input_messages,
+                str(new_user_msg.id) if new_user_msg else None,
+                model_id,
+                system,
+                send_event,
+                str(current_user.id),
+                conversation_id,
+                tool_cache,
+                body.search_mode,
+            )
+            if conversation_id and new_messages:
+                async with async_session() as persistence_db:
+                    await persist_graph_messages(
+                        persistence_db,
+                        conversation_id,
+                        new_messages,
+                    )
+            done_id = next(
+                (str(message.id) for message in reversed(new_messages) if message.id),
+                "",
+            )
+            await send_event({"type": "done", "messageId": done_id})
+        except asyncio.CancelledError:
+            logger.info("Graph run cancelled for conversation %s", conversation_id)
+            await invalidate_checkpoint()
+            raise
+        except Exception as exc:
+            logger.exception("Graph or persistence failure")
+            await invalidate_checkpoint()
+            await send_event({
+                "type": "error",
+                "message": f"生成或保存回复时发生错误: {exc}",
+                "code": "STREAM_ERROR",
+            })
 
-                # Collect tool_result events for persistence
-                if event.get("type") == "tool_result":
-                    collected_messages.append(ToolMessage(
-                        content=json.dumps(event.get("result", {}), ensure_ascii=False),
-                        tool_call_id=event.get("toolCallId", ""),
-                    ))
-
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
-        finally:
-            if not graph_task.done():
-                graph_task.cancel()
-
-            # Persist assistant + tool messages after stream completes.
-            # Only when the graph finished normally (not cancelled/interrupted).
-            if body.conversation_id and graph_task.done() and not graph_task.cancelled():
-                try:
-                    new_messages = graph_task.result()
-                    if new_messages:
-                        await _persist_messages(
-                            db, body.conversation_id, new_messages
-                        )
-                        logger.info(
-                            "Persisted %d messages for conversation %s",
-                            len(new_messages), body.conversation_id,
-                        )
-                except Exception:
-                    logger.exception("Failed to persist messages")
-
-            # Drain remaining events
-            while not event_queue.empty():
-                event_queue.get_nowait()
+    graph_task = asyncio.create_task(run_and_persist())
 
     return StreamingResponse(
-        sse_generator(),
+        stream_sse_events(event_queue, graph_task),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
-
-
-# ——— Helpers ———
-
-
-def _db_message_to_lc(msg: Message) -> list[BaseMessage]:
-    """Convert a DB Message (with parts) to LangChain messages."""
-    parts = sorted(msg.parts or [], key=lambda p: p.position)
-    result: list[BaseMessage] = []
-
-    if msg.role == "user":
-        text = ""
-        for p in parts:
-            if p.type == "text" and p.text:
-                text += p.text
-        result.append(HumanMessage(content=text))
-    elif msg.role == "assistant":
-        text = ""
-        reasoning = ""
-
-        for p in parts:
-            if p.type == "text" and p.text:
-                text += p.text
-            elif p.type == "reasoning" and p.text:
-                reasoning = p.text
-
-        ai_msg = AIMessage(content=text)
-        # NOTE: Do NOT attach tool_calls when loading from DB.
-        # ToolMessages are not persisted with results, so attaching tool_calls
-        # without corresponding ToolMessages creates an invalid conversation
-        # state that causes the LLM to return empty responses on follow-up.
-        if reasoning:
-            ai_msg.additional_kwargs["reasoning_content"] = reasoning
-        result.append(ai_msg)
-    elif msg.role == "tool":
-        for p in parts:
-            if p.tool_output:
-                result.append(ToolMessage(
-                    content=json.dumps(p.tool_output, ensure_ascii=False),
-                    tool_call_id=p.tool_call_id or "",
-                ))
-
-    return result
-
-
-async def _persist_single_message(
-    db: AsyncSession,
-    conversation_id: str,
-    lc_msg: BaseMessage,
-) -> None:
-    """Persist a single LangChain message to the database."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-
-    if isinstance(lc_msg, HumanMessage):
-        role = "user"
-    elif isinstance(lc_msg, AIMessage):
-        role = "assistant"
-    elif isinstance(lc_msg, ToolMessage):
-        role = "tool"
-    else:
-        return
-
-    msg = Message(
-        id=uuid.uuid4().hex,
-        conversation_id=conversation_id,
-        role=role,
-        created_at=now,
-    )
-    db.add(msg)
-
-    pos = 0
-    if isinstance(lc_msg, HumanMessage):
-        text = lc_msg.content
-        if isinstance(text, str) and text.strip():
-            db.add(MessagePart(
-                id=uuid.uuid4().hex,
-                message_id=msg.id,
-                type="text",
-                text=text,
-                position=pos,
-            ))
-
-    await db.commit()

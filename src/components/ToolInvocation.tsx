@@ -10,6 +10,7 @@ import {
   CircleCheck,
   CircleX,
   Hourglass,
+  Telescope,
   Wrench,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -26,7 +27,7 @@ interface ToolMeta {
 }
 
 const TOOL_META: Record<string, ToolMeta> = {
-  getWeather: {
+  get_weather: {
     label: "查询天气",
     icon: CloudSun,
     formatResult: (output) => (
@@ -74,6 +75,21 @@ const TOOL_META: Record<string, ToolMeta> = {
         </p>
         <p className="text-[11.5px] text-[var(--fg-muted)]">
           找到 {(output.results as unknown[])?.length ?? 0} 条结果
+        </p>
+      </div>
+    ),
+  },
+  deep_search: {
+    label: "深度搜索",
+    icon: Telescope,
+    formatResult: (output) => (
+      <div className="space-y-1.5 py-0.5">
+        <p className="text-[12.5px] font-medium text-[var(--fg)]">
+          主题：{String(output.query ?? "")}
+        </p>
+        <p className="text-[11.5px] text-[var(--fg-muted)]">
+          完成 {(output.queries as unknown[])?.length ?? 0} 个检索方向，整理了{" "}
+          {(output.results as unknown[])?.length ?? 0} 个来源
         </p>
       </div>
     ),

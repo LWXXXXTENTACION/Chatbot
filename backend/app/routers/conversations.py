@@ -5,7 +5,7 @@ All endpoints require authentication. Data is scoped to the current user.
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -169,6 +169,7 @@ async def update_conversation(
 @router.delete("/{conversation_id}")
 async def delete_conversation(
     conversation_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -185,5 +186,14 @@ async def delete_conversation(
 
     await db.delete(conv)
     await db.commit()
+    checkpointer = getattr(request.app.state, "checkpointer", None)
+    if checkpointer is not None:
+        try:
+            await checkpointer.adelete_thread(conversation_id)
+        except Exception:
+            logger.exception(
+                "Conversation deleted but checkpoint cleanup failed: %s",
+                conversation_id,
+            )
     logger.info(f"Conversation deleted: {conversation_id} by {current_user.username}")
     return {"ok": True}

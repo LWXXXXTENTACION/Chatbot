@@ -24,7 +24,8 @@
 | 代码块高亮 | `rehype-highlight` + 自定义 `CodeBlock`（语言标签/复制） |
 | 工具调用可视化 | LangGraph 工具节点；`ToolInvocation` 渲染各状态 |
 | Artifact 系统 | `createArtifact` 工具 → `ArtifactCard` + `ArtifactPanel`（预览/源码切换） |
-| 对话历史管理 | Zustand + FastAPI/SQLite 持久化 |
+| 对话历史管理 | SQLAlchemy SQLite 业务库 + LangGraph AsyncSqliteSaver |
+| 热缓存与限流 | Redis 精确工具缓存 + 原子 Token Bucket（故障自动降级） |
 
 ## 快速开始
 

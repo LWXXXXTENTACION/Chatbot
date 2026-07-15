@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Type check
+        run: ./node_modules/.bin/tsc --noEmit --incremental false
+      - name: Production build
+        run: npm run build
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install backend
+        run: python -m pip install -e "./backend[dev]"
+      - name: Syntax check
+        run: >-
+          python -c 'import ast,pathlib;
+          [ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+          for p in pathlib.Path("backend/app").rglob("*.py")]'
+      - name: Test
+        run: python -m pytest backend -q

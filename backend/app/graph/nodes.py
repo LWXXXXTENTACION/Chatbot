@@ -4,41 +4,65 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Callable, Coroutine
+from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.runtime import Runtime
 
 from app.config import DeepSeekModelId, tools_enabled
-from app.graph.deep_search import deep_search_agent
+from app.graph.deep_search import dedupe_sources, deep_search_agent
+from app.graph.context import AgentRuntimeContext, StreamCallback
 from app.graph.state import AgentState
 from app.llm.client import create_deepseek_chat
-from app.tools import MAIN_AGENT_TOOLS, STANDARD_TOOLS
+from app.tools import (
+    DEEP_SEARCH_MODE_TOOLS,
+    FAST_SEARCH_TOOLS,
+    MAIN_AGENT_TOOLS,
+    STANDARD_TOOLS,
+    web_search,
+)
 
 logger = logging.getLogger("chatbot.graph")
 
-StreamCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
-STANDARD_TOOL_MAP = {tool.name: tool for tool in STANDARD_TOOLS}
+TOOL_MAP = {tool.name: tool for tool in [*STANDARD_TOOLS, web_search]}
+SEARCH_TOOL_NAMES = {"web_search", "deep_search"}
+
+SEARCH_MODE_PROMPTS = {
+    "web": (
+        "用户已开启“联网搜索”。本回合回答前必须先调用 web_search 一次，使用一个最贴近用户问题的查询；"
+        "只根据返回的 results 陈述可核验事实，并在对应句末使用 [[cite:1]] 或 [[cite:1,2]]。"
+    ),
+    "deep": (
+        "用户已开启“深度搜索”。本回合回答前必须先调用 deep_search 一次，将完整问题放入 query，"
+        "需要的范围放入 focus；根据研究摘要回答，并为每个可核验事实添加句末引用。"
+    ),
+}
 
 MAIN_AGENT_SYSTEM_PROMPT = """你是唯一直接与用户对话的主 Agent。你负责理解请求、选择工具并给出最终答案；不要把任务路由给代码、数学、创意或通用子 Agent。
 
 工具规则：
 - 天气、计算和工件由你直接调用对应工具。
 - 只有当问题依赖实时信息、外部事实或明确要求查证时，才调用 deep_search。
-- deep_search 会委派给一个独立搜索 Agent；每个用户回合最多调用一次。不要调用或假装调用 raw web_search。
+- web_search 是用户主动选择的快速联网搜索；deep_search 会委派给独立搜索 Agent 做多方向研究。每个用户回合最多执行一次搜索。
 - 能直接回答时不要调用工具。使用 create_artifact 后，不要在正文重复完整工件内容。
 
 回答规则：
 - 默认使用中文，简洁、准确，并按需使用 Markdown、代码块或 LaTeX。
-- deep_search 返回的 results 是编号来源，summary 是研究简报。重要的可核验结论后立刻添加 [[cite:1]] 或 [[cite:1,2]]。
-- 引用编号只能对应本回合 deep_search 的 results；不要编造编号，不要把引用集中到段尾或单独列参考资料。
+- web_search 和 deep_search 返回的 results 都是编号来源；deep_search 的 summary 是研究简报。最终回答中，每个依赖来源的事实句都必须在该句句末标点前紧跟 [[cite:1]] 或 [[cite:1,2]]，例如“该版本于 2026 年发布[[cite:1]]。”
+- 一个引用只支撑它紧邻的句子；同一句由多个来源支撑时合并为一个标记。不要把多个句子的引用集中到段尾，也不要单独列参考资料。
+- 引用编号只能对应本回合搜索工具的 results；不要编造编号，不要输出裸 URL，前端会把引用编号转换成可点击来源链接。
 - 来源不足、冲突或不确定时要明确说明。"""
 
 
-def _get_stream_callback(config: RunnableConfig) -> StreamCallback | None:
-    if config and "configurable" in config:
-        return config["configurable"].get("stream_callback")  # type: ignore[return-value]
-    return None
+def _runtime_context(runtime: Any) -> AgentRuntimeContext:
+    context = getattr(runtime, "context", None)
+    return context if isinstance(context, AgentRuntimeContext) else AgentRuntimeContext()
 
 
 async def _emit(callback: StreamCallback | None, event: dict[str, Any]) -> None:
@@ -57,17 +81,104 @@ def _json_content(value: Any) -> str:
         return json.dumps({"result": str(value)}, ensure_ascii=False)
 
 
-async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+def _message_text(message: BaseMessage) -> str:
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content or "")
+
+
+async def _explicit_search_call(
+    messages: list[BaseMessage],
+    search_mode: str,
+    callback: StreamCallback | None,
+) -> dict[str, Any]:
+    """Create the selected search call without unsupported model tool_choice."""
+    query = next(
+        (
+            _message_text(message).strip()
+            for message in reversed(messages)
+            if isinstance(message, HumanMessage) and _message_text(message).strip()
+        ),
+        "",
+    )
+    tool_name = "web_search" if search_mode == "web" else "deep_search"
+    args: dict[str, Any] = {"query": query}
+    if tool_name == "web_search":
+        args["max_results"] = 5
+    else:
+        args["focus"] = ""
+
+    message_id = uuid.uuid4().hex
+    call_id = uuid.uuid4().hex
+    args_json = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+    await _emit(callback, {
+        "type": "tool_call_start",
+        "messageId": message_id,
+        "toolCallId": call_id,
+        "toolName": tool_name,
+    })
+    await _emit(callback, {
+        "type": "tool_call_delta",
+        "toolCallId": call_id,
+        "delta": args_json,
+    })
+    await _emit(callback, {"type": "tool_call_end", "toolCallId": call_id})
+    return {
+        "messages": [AIMessage(
+            content="",
+            tool_calls=[{
+                "id": call_id,
+                "name": tool_name,
+                "args": args,
+                "type": "tool_call",
+            }],
+            id=message_id,
+        )]
+    }
+
+
+async def chat_node(
+    state: AgentState,
+    runtime: Runtime[AgentRuntimeContext],
+) -> dict[str, Any]:
     """Stream one main-agent LLM call and return its assembled AI message."""
-    callback = _get_stream_callback(config)
+    context = _runtime_context(runtime)
+    callback = context.stream_callback
     model_id: DeepSeekModelId = state.get("model_id", "deepseek-v4-flash")  # type: ignore[assignment]
     messages: list[BaseMessage] = state.get("messages", [])
     citations = state.get("source_citations", [])
 
+    if (
+        tools_enabled(model_id)
+        and context.search_mode in {"web", "deep"}
+        and state.get("search_iteration", 0) == 0
+    ):
+        return await _explicit_search_call(messages, context.search_mode, callback)
+
     llm = create_deepseek_chat(model_id)
-    llm_with_tools = llm.bind_tools(MAIN_AGENT_TOOLS) if tools_enabled(model_id) else llm
+    tools = (
+        FAST_SEARCH_TOOLS
+        if context.search_mode == "web"
+        else DEEP_SEARCH_MODE_TOOLS
+        if context.search_mode == "deep"
+        else MAIN_AGENT_TOOLS
+    )
+    if tools_enabled(model_id):
+        llm_with_tools = llm.bind_tools(tools)
+    else:
+        llm_with_tools = llm
 
     system_messages = [SystemMessage(content=MAIN_AGENT_SYSTEM_PROMPT)]
+    mode_prompt = SEARCH_MODE_PROMPTS.get(context.search_mode)
+    if mode_prompt and tools_enabled(model_id):
+        system_messages.append(SystemMessage(content=mode_prompt))
     custom_prompt = state.get("system_prompt", "").strip()
     if custom_prompt:
         system_messages.append(SystemMessage(content=custom_prompt))
@@ -77,7 +188,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         ))
     llm_input: list[BaseMessage] = [*system_messages, *messages]
 
-    message_id = f"msg_{uuid.uuid4().hex[:12]}"
+    message_id = uuid.uuid4().hex
     full_text = ""
     full_reasoning = ""
     text_started = False
@@ -183,14 +294,16 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
                 "sources": citations,
             })
 
-        final_message = AIMessage(content=full_text, additional_kwargs=additional_kwargs)
+        final_message = AIMessage(
+            content=full_text,
+            additional_kwargs=additional_kwargs,
+            id=message_id,
+        )
         if tool_calls:
             final_message.tool_calls = tool_calls  # type: ignore[assignment]
         return {"messages": [final_message]}
     except asyncio.CancelledError:
         logger.info("Main-agent call cancelled")
-        if full_text:
-            return {"messages": [AIMessage(content=full_text)]}
         raise
     except Exception as exc:
         logger.exception("Main-agent call failed")
@@ -200,9 +313,10 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
 async def _execute_tool_call(
     call: dict[str, Any],
     *,
-    allow_deep_search: bool,
+    allow_search: bool,
     model_id: DeepSeekModelId,
     callback: StreamCallback | None,
+    tool_cache: Any | None,
 ) -> tuple[ToolMessage, list[dict[str, Any]], str, list[str]]:
     """Execute one main-agent tool call and return state additions."""
     call_id = str(call.get("id", ""))
@@ -213,28 +327,43 @@ async def _execute_tool_call(
     queries: list[str] = []
     status = "success"
 
+    cached = False
     try:
-        if name == "deep_search":
-            if not allow_deep_search:
-                status = "error"
-                output: Any = {
-                    "error": "每个用户回合最多运行一次 deep_search；请使用已有研究结果回答。"
-                }
-            else:
+        if name in SEARCH_TOOL_NAMES and not allow_search:
+            status = "error"
+            output: Any = {
+                "error": "每个用户回合最多运行一次搜索；请使用已有搜索结果回答。"
+            }
+        else:
+            lookup = await tool_cache.get(name, args, model_id=model_id) if tool_cache else None
+            if lookup and lookup.hit:
+                output = lookup.value
+                cached = True
+            elif name == "deep_search":
                 output = await deep_search_agent(
                     query=str(args.get("query", "")).strip(),
                     focus=str(args.get("focus", "")).strip(),
                     model_id=model_id,
                     callback=callback,
                 )
-                citations = output.get("results", [])
+            elif name in TOOL_MAP:
+                output = await TOOL_MAP[name].ainvoke(args)
+            else:
+                status = "error"
+                output = {"error": f"未知工具：{name}"}
+
+        if name == "web_search" and isinstance(output, dict) and not output.get("error"):
+            output = {**output, "results": dedupe_sources([output])}
+        if not cached and status == "success" and tool_cache:
+            await tool_cache.put(name, args, output, model_id=model_id)
+
+        if name in SEARCH_TOOL_NAMES and isinstance(output, dict) and not output.get("error"):
+            citations = output.get("results", [])
+            if name == "deep_search":
                 research_brief = str(output.get("summary", ""))
                 queries = [str(item) for item in output.get("queries", [])]
-        elif name in STANDARD_TOOL_MAP:
-            output = await STANDARD_TOOL_MAP[name].ainvoke(args)
-        else:
-            status = "error"
-            output = {"error": f"未知工具：{name}"}
+            else:
+                queries = [str(output.get("query", args.get("query", "")))]
     except Exception as exc:
         logger.exception("Tool %s failed", name)
         status = "error"
@@ -244,6 +373,7 @@ async def _execute_tool_call(
         "type": "tool_result",
         "toolCallId": call_id,
         "result": output,
+        "cached": cached,
         "error": output.get("error") if status == "error" and isinstance(output, dict) else None,
     })
     return (
@@ -252,6 +382,7 @@ async def _execute_tool_call(
             tool_call_id=call_id,
             name=name,
             status=status,  # type: ignore[arg-type]
+            id=uuid.uuid4().hex,
         ),
         citations,
         research_brief,
@@ -259,28 +390,33 @@ async def _execute_tool_call(
     )
 
 
-async def custom_tool_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+async def custom_tool_node(
+    state: AgentState,
+    runtime: Runtime[AgentRuntimeContext],
+) -> dict[str, Any]:
     """Execute direct tools and delegate the single allowed research call."""
-    callback = _get_stream_callback(config)
+    context = _runtime_context(runtime)
+    callback = context.stream_callback
     messages = state.get("messages", [])
     if not messages or not isinstance(messages[-1], AIMessage) or not messages[-1].tool_calls:
         return {"messages": []}
 
     calls = messages[-1].tool_calls
     already_searched = state.get("search_iteration", 0) > 0
-    first_deep_index = next(
-        (index for index, call in enumerate(calls) if call.get("name") == "deep_search"),
+    first_search_index = next(
+        (index for index, call in enumerate(calls) if call.get("name") in SEARCH_TOOL_NAMES),
         None,
     )
     model_id: DeepSeekModelId = state.get("model_id", "deepseek-v4-flash")  # type: ignore[assignment]
     results = await asyncio.gather(*(
         _execute_tool_call(
             call,
-            allow_deep_search=(
-                not already_searched and first_deep_index is not None and index == first_deep_index
+            allow_search=(
+                not already_searched and first_search_index is not None and index == first_search_index
             ),
             model_id=model_id,
             callback=callback,
+            tool_cache=context.tool_cache,
         )
         for index, call in enumerate(calls)
     ))
@@ -289,11 +425,11 @@ async def custom_tool_node(state: AgentState, config: RunnableConfig) -> dict[st
     new_citations = next((item[1] for item in results if item[1]), [])
     research_brief = next((item[2] for item in results if item[2]), "")
     new_queries = [query for item in results for query in item[3]]
-    deep_search_attempted = any(call.get("name") == "deep_search" for call in calls)
+    search_attempted = any(call.get("name") in SEARCH_TOOL_NAMES for call in calls)
     return {
         "messages": tool_messages,
         "source_citations": new_citations or state.get("source_citations", []),
         "retrieved_docs": research_brief or state.get("retrieved_docs", ""),
-        "search_iteration": state.get("search_iteration", 0) + (1 if deep_search_attempted else 0),
+        "search_iteration": state.get("search_iteration", 0) + (1 if search_attempted else 0),
         "search_history": [*state.get("search_history", []), *new_queries],
     }

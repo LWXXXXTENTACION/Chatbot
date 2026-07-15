@@ -6,8 +6,9 @@ Exposes /chat/stream (SSE) and /ws (WebSocket, kept for direct testing).
 import asyncio
 import json
 import logging
+import os
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -15,30 +16,55 @@ from fastapi.responses import StreamingResponse, Response
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.config import (
+    AUTO_MIGRATE,
+    CHECKPOINT_DB_PATH,
     DEEPSEEK_API_KEY,
     DEFAULT_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     DeepSeekModelId,
+    REDIS_ENABLED,
+    REDIS_URL,
     validate_model,
 )
-from app.database.engine import get_db
-from app.database.models import Base
+from app.cache import ToolCache, create_redis_client
+from app.database.migrate import run_migrations
 from app.graph.builder import build_graph
+from app.graph.context import AgentRuntimeContext, SearchMode, normalize_search_mode
 from app.graph.state import AgentState
+from app.middleware.rate_limit import RedisRateLimiter
+from app.streaming import stream_sse_events
 
 logger = logging.getLogger("chatbot")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create database tables on startup."""
+    """Own database migrations, checkpointer, graph, and Redis connections."""
+    os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
     from app.database.engine import engine
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created")
-    yield
-    await engine.dispose()
+    if AUTO_MIGRATE:
+        await asyncio.to_thread(run_migrations)
+        logger.info("Database migrations applied")
+
+    async with AsyncExitStack() as stack:
+        checkpointer = await stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
+        )
+        await checkpointer.setup()
+        redis_client = await create_redis_client(REDIS_URL, enabled=REDIS_ENABLED)
+        app.state.checkpointer = checkpointer
+        app.state.graph = build_graph(checkpointer=checkpointer)
+        app.state.tool_cache = ToolCache(redis_client)
+        app.state.rate_limiter = RedisRateLimiter(redis_client)
+        app.state.redis = redis_client
+        try:
+            yield
+        finally:
+            if redis_client is not None:
+                await redis_client.aclose()
+            await engine.dispose()
 
 
 app = FastAPI(
@@ -97,6 +123,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
             if parts and isinstance(parts, list):
                 text_parts: list[str] = []
                 tool_calls: list[dict[str, Any]] = []
+                tool_results: list[ToolMessage] = []
                 for part in parts:
                     part_type = part.get("type", "")
                     if part_type == "text":
@@ -112,7 +139,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
                             "type": "tool_call",
                         })
                         if part.get("state") == "output-available" and part.get("output"):
-                            result.append(ToolMessage(
+                            tool_results.append(ToolMessage(
                                 content=json.dumps(part["output"], ensure_ascii=False),
                                 tool_call_id=tool_call_id,
                             ))
@@ -120,6 +147,7 @@ def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
                 if tool_calls:
                     ai_msg.tool_calls = tool_calls  # type: ignore[assignment]
                 result.append(ai_msg)
+                result.extend(tool_results)
             else:
                 text = str(content) if isinstance(content, str) else ""
                 if isinstance(content, list):
@@ -139,6 +167,7 @@ async def _run_graph_and_stream(
     model_id: DeepSeekModelId,
     system_prompt: str,
     send_event: Any,
+    search_mode: SearchMode = "auto",
 ) -> None:
     """Run the LangGraph agent and emit events via the callback."""
     message_id = f"msg_{uuid.uuid4().hex[:12]}"
@@ -157,10 +186,17 @@ async def _run_graph_and_stream(
             "error": None,
         }
         config = {
-            "configurable": {"stream_callback": send_event},
             "recursion_limit": 12,
         }
-        await _graph.ainvoke(initial_state, config=config)  # type: ignore[arg-type]
+        await _graph.ainvoke(
+            initial_state,
+            config=config,
+            context=AgentRuntimeContext(
+                stream_callback=send_event,
+                tool_cache=getattr(app.state, "tool_cache", None),
+                search_mode=search_mode,
+            ),
+        )
         # Send done event after successful completion
         await send_event({"type": "done", "messageId": message_id})
     except asyncio.CancelledError:
@@ -195,6 +231,7 @@ async def chat_stream(request: Request):
     messages = body.get("messages", [])
     model_id = validate_model(body.get("model", DEFAULT_MODEL))
     system = body.get("system", DEFAULT_SYSTEM_PROMPT)
+    search_mode = normalize_search_mode(body.get("search_mode", "auto"))
 
     if not DEEPSEEK_API_KEY:
         return Response(
@@ -204,38 +241,16 @@ async def chat_stream(request: Request):
         )
 
     event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    stop = False
 
     async def send_event(event: dict[str, Any]) -> None:
-        nonlocal stop
         await event_queue.put(event)
-        if event.get("type") in ("done", "error"):
-            stop = True
 
     graph_task = asyncio.create_task(
-        _run_graph_and_stream(messages, model_id, system, send_event)
+        _run_graph_and_stream(messages, model_id, system, send_event, search_mode)
     )
 
-    async def sse_generator():
-        nonlocal stop
-        try:
-            while not stop:
-                try:
-                    event = await asyncio.wait_for(event_queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    yield b": keepalive\n\n"
-                    continue
-                if event is None:
-                    break
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
-        finally:
-            if not graph_task.done():
-                graph_task.cancel()
-            while not event_queue.empty():
-                event_queue.get_nowait()
-
     return StreamingResponse(
-        sse_generator(),
+        stream_sse_events(event_queue, graph_task),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -266,8 +281,15 @@ async def chat_websocket(ws: WebSocket) -> None:
         raw_messages: list[dict[str, Any]],
         model_id: DeepSeekModelId,
         system_prompt: str,
+        search_mode: SearchMode,
     ) -> None:
-        await _run_graph_and_stream(raw_messages, model_id, system_prompt, send_event)
+        await _run_graph_and_stream(
+            raw_messages,
+            model_id,
+            system_prompt,
+            send_event,
+            search_mode,
+        )
 
     try:
         async for raw in ws.iter_text():
@@ -292,12 +314,15 @@ async def chat_websocket(ws: WebSocket) -> None:
                 messages = data.get("messages", [])
                 model_id = validate_model(data.get("model", DEFAULT_MODEL))
                 system = data.get("system", DEFAULT_SYSTEM_PROMPT)
+                search_mode = normalize_search_mode(data.get("search_mode", "auto"))
 
                 if not DEEPSEEK_API_KEY:
                     await send_event({"type": "error", "message": "未配置 DEEPSEEK_API_KEY", "code": "CONFIG_ERROR"})
                     continue
 
-                current_task = asyncio.create_task(run_graph_stream(messages, model_id, system))
+                current_task = asyncio.create_task(
+                    run_graph_stream(messages, model_id, system, search_mode)
+                )
 
             elif msg_type == "stop":
                 stop_event.set()

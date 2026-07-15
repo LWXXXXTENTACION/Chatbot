@@ -72,6 +72,8 @@ export interface Artifact {
 // Citation / Source Types
 // ============================================================
 
+export type SearchMode = "auto" | "web" | "deep";
+
 export interface Source {
   title: string;
   url: string;
@@ -112,6 +114,7 @@ export interface ChatSendRequest {
   };
   messages: ChatHistoryMessage[];   // legacy: full history fallback
   model?: DeepSeekModelId;
+  search_mode?: SearchMode;
 }
 
 export interface ChatHistoryMessage {
@@ -176,6 +179,7 @@ export interface SSEToolResult {
   type: "tool_result";
   toolCallId: string;
   result: unknown;
+  cached?: boolean;
   error: string | null;
 }
 

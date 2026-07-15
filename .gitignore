@@ -30,6 +30,16 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local backend state (kept on disk, never committed)
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+
 # env files (can opt-in for committing if needed)
 .env*
 

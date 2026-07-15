@@ -2,6 +2,8 @@
 Pydantic schemas for chat endpoints.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -18,6 +20,7 @@ class ChatRequest(BaseModel):
     messages: list[dict] | None = None  # legacy: full history
     model: str | None = None
     system: str | None = None
+    search_mode: Literal["auto", "web", "deep"] = "auto"
 
 
 class ChatNewMessage(BaseModel):

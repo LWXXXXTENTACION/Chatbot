@@ -153,8 +153,9 @@ async def deep_search_agent(
     synthesis_prompt = (
         f"用户问题：{query}\n研究重点：{focus or '无'}\n\n来源：\n{evidence}\n\n"
         "写一份紧凑的研究简报供主 Agent 使用。只依据来源，指出冲突或不确定性。"
-        "每个事实后必须使用 [[cite:1]] 或 [[cite:1,2]]，编号只能来自上面的来源。"
-        "不要另写参考资料列表。"
+        "每个事实句都必须在该句句末标点前紧跟 [[cite:1]] 或 [[cite:1,2]]；"
+        "一个标记只支撑它紧邻的句子，同一句有多个来源时合并编号。"
+        "编号只能来自上面的来源，不要输出裸 URL，不要把引用集中到段末，也不要另写参考资料列表。"
     )
     try:
         synthesis = await llm.ainvoke([
@@ -175,4 +176,3 @@ async def deep_search_agent(
         "summary": summary,
         "results": sources,
     }
-

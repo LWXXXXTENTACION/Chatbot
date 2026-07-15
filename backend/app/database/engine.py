@@ -1,16 +1,14 @@
-"""
-Async SQLAlchemy engine and session factory for SQLite.
-"""
+"""Async SQLAlchemy engine and session factory."""
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import DATABASE_URL
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args={"check_same_thread": False},
-)
+_engine_kwargs = {"echo": False}
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 
 async_session = async_sessionmaker(
     engine,

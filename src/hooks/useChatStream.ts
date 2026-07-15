@@ -12,6 +12,7 @@ import type {
   ToolPartBase,
   SSEActivity,
   SSEServerMessage,
+  SearchMode,
 } from "@/lib/types";
 import { extractArtifactFields } from "@/lib/partial-json";
 import { useChatStore } from "@/lib/store";
@@ -36,7 +37,7 @@ export interface UseChatStreamReturn {
   activities: Activity[];
   sendMessage: (
     message: { text: string },
-    opts?: { body?: { model?: DeepSeekModelId } },
+    opts?: { body?: { model?: DeepSeekModelId; searchMode?: SearchMode } },
   ) => void;
   stop: () => void;
   status: ChatStatus;
@@ -481,7 +482,7 @@ export function useChatStream({
   const sendMessage = useCallback(
     (
       msg: { text: string },
-      opts?: { body?: { model?: DeepSeekModelId } },
+      opts?: { body?: { model?: DeepSeekModelId; searchMode?: SearchMode } },
     ) => {
       const text = msg.text.trim();
       if (!text) return;
@@ -531,6 +532,7 @@ export function useChatStream({
           },
           messages: streamMessages, // fallback for backward compat
           model: opts?.body?.model,
+          search_mode: opts?.body?.searchMode ?? "auto",
         }),
         // Pass abort signal so this request can be cancelled on conversation switch
         signal: abortController.signal,

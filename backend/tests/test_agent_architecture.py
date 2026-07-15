@@ -3,7 +3,13 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from app.graph import nodes
 from app.graph.builder import build_graph
@@ -107,6 +113,7 @@ def test_explicit_search_mode_creates_the_selected_tool_call_without_llm(
     message = result["messages"][0]
     assert message.tool_calls[0]["name"] == expected_tool
     assert message.tool_calls[0]["args"]["query"] == "current question"
+    assert message.tool_calls[0]["id"].startswith(nodes.FORCED_SEARCH_CALL_PREFIX)
     assert [event["type"] for event in events] == [
         "tool_call_start",
         "tool_call_delta",
@@ -118,23 +125,70 @@ def test_explicit_search_followup_never_sends_tool_choice(monkeypatch):
     class FakeLlm:
         def __init__(self):
             self.bind_kwargs = None
+            self.tools = []
+            self.messages = []
 
-        def bind_tools(self, _tools, **kwargs):
+        def bind_tools(self, tools, **kwargs):
+            self.tools = tools
             self.bind_kwargs = kwargs
             return self
 
-        async def astream(self, _messages):
+        async def astream(self, messages):
+            self.messages = messages
             yield AIMessageChunk(content="final answer")
 
     llm = FakeLlm()
     monkeypatch.setattr(nodes, "create_deepseek_chat", lambda _model: llm)
 
+    call_id = f"{nodes.FORCED_SEARCH_CALL_PREFIX}test"
     asyncio.run(nodes.chat_node(
-        base_state(search_iteration=1),
+        base_state(
+            search_iteration=1,
+            messages=[
+                HumanMessage(content="btc"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "id": call_id,
+                        "name": "web_search",
+                        "args": {"query": "btc"},
+                        "type": "tool_call",
+                    }],
+                ),
+                ToolMessage(
+                    content=json.dumps({
+                        "query": "btc",
+                        "results": [{
+                            "title": "Bitcoin",
+                            "url": "https://example.com/btc",
+                            "content": "evidence",
+                        }],
+                    }),
+                    tool_call_id=call_id,
+                    name="web_search",
+                ),
+            ],
+        ),
         runtime(search_mode="web"),
     ))
 
     assert llm.bind_kwargs == {}
+    assert [tool.name for tool in llm.tools] == [
+        "get_weather",
+        "calculate",
+        "create_artifact",
+    ]
+    assert not any(
+        isinstance(message, ToolMessage)
+        or isinstance(message, AIMessage) and message.tool_calls
+        for message in llm.messages
+    )
+    evidence_message = next(
+        message
+        for message in llm.messages
+        if isinstance(message, SystemMessage) and "本回合搜索证据" in str(message.content)
+    )
+    assert '"query": "btc"' in str(evidence_message.content)
 
 
 def test_fast_web_search_emits_sanitized_sources(monkeypatch):

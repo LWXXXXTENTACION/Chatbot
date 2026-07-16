@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import StreamWriter
 
 from app.config import DeepSeekModelId
-from app.graph.context import AgentRuntimeContext, StreamCallback
+from app.graph.context import AgentRuntimeContext
 from app.graph.deep_search import dedupe_sources, run_deep_search_workflow
 from app.graph.model import emit
 from app.graph.state import AgentState, SourceCitation
@@ -34,7 +35,7 @@ async def _execute_one(
     *,
     allow_search: bool,
     model_id: DeepSeekModelId,
-    callback: StreamCallback | None,
+    writer: StreamWriter,
     runtime_context: AgentRuntimeContext,
 ) -> tuple[ToolMessage, list[SourceCitation]]:
     """Execute one call and return its message plus normalized citations."""
@@ -62,7 +63,7 @@ async def _execute_one(
                     query=str(args.get("query", "")).strip(),
                     focus=str(args.get("focus", "")).strip(),
                     model_id=model_id,
-                    context=runtime_context,
+                    writer=writer,
                 )
             elif name in TOOL_MAP:
                 output = await TOOL_MAP[name].ainvoke(args)
@@ -82,7 +83,7 @@ async def _execute_one(
         status = "error"
         output = {"error": str(exc)}
 
-    await emit(callback, {
+    await emit(writer, {
         "type": "tool_result",
         "toolCallId": call_id,
         "result": output,
@@ -107,6 +108,7 @@ async def _execute_one(
 async def execute_tool_batch(
     state: AgentState,
     context: AgentRuntimeContext,
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Execute exactly one tool batch selected by the decision node."""
     messages = state.get("messages", [])
@@ -126,7 +128,7 @@ async def execute_tool_batch(
             call,
             allow_search=first_search_index is None or index == first_search_index,
             model_id=model_id,
-            callback=context.stream_callback,
+            writer=writer,
             runtime_context=context,
         )
         for index, call in enumerate(calls)
@@ -143,6 +145,7 @@ async def execute_general_tool_batch(
     *,
     model_id: DeepSeekModelId,
     context: AgentRuntimeContext,
+    writer: StreamWriter,
 ) -> list[ToolMessage]:
     """Execute a General Agent batch while rejecting every search tool."""
     results = await asyncio.gather(*(
@@ -150,7 +153,7 @@ async def execute_general_tool_batch(
             call,
             allow_search=False,
             model_id=model_id,
-            callback=context.stream_callback,
+            writer=writer,
             runtime_context=context,
         )
         for call in calls

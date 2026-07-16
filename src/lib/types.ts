@@ -230,6 +230,11 @@ export interface SSEContextStatus {
   overflowed: boolean;
 }
 
+export interface SSETraceSummary {
+  type: "trace_summary";
+  trace: Record<string, unknown>;
+}
+
 /** Union of all SSE event types received from the backend. */
 export type SSEServerMessage =
   | SSETextStart
@@ -247,4 +252,5 @@ export type SSEServerMessage =
   | SSEError
   | SSEPong
   | SSEActivity
-  | SSEContextStatus;
+  | SSEContextStatus
+  | SSETraceSummary;

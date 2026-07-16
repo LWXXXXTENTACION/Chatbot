@@ -37,14 +37,33 @@ def base_state(**overrides):
     return state
 
 
-def runtime(callback=None, tool_cache=None, search_mode="auto"):
+def runtime(tool_cache=None, search_mode="auto"):
     return SimpleNamespace(
         context=AgentRuntimeContext(
-            stream_callback=callback,
             tool_cache=tool_cache,
             search_mode=search_mode,
         )
     )
+
+
+def noop_writer(_event):
+    return None
+
+
+async def collect_graph_stream(graph, input_state, *, context):
+    events = []
+    final_state = None
+    async for part in graph.astream(
+        input_state,
+        context=context,
+        stream_mode=["values", "custom"],
+        version="v2",
+    ):
+        if part["type"] == "custom":
+            events.append(part["data"])
+        elif part["type"] == "values":
+            final_state = part["data"]
+    return final_state, events
 
 
 def _assert_acyclic(graph) -> None:
@@ -124,6 +143,64 @@ def test_backend_exposes_only_the_authenticated_chat_transport():
     assert not any(path in {"/chat/stream", "/ws"} for path, _method in routes)
 
 
+def test_api_consumes_langgraph_custom_stream_without_runtime_callback():
+    from app.routers import chat as chat_router
+
+    human = HumanMessage(content="hello", id="human-1")
+    answer = AIMessage(content="world", id="answer-1")
+
+    class FakeGraph:
+        async def astream(
+            self,
+            initial_state,
+            *,
+            config,
+            context,
+            stream_mode,
+            version,
+        ):
+            assert initial_state["messages"] == [human]
+            assert config["configurable"]["thread_id"] == "conversation"
+            assert not hasattr(context, "stream_callback")
+            assert stream_mode == ["values", "custom"]
+            assert version == "v2"
+            yield {
+                "type": "custom",
+                "ns": (),
+                "data": {"type": "text_delta", "messageId": "answer-1", "delta": "world"},
+            }
+            yield {
+                "type": "values",
+                "ns": (),
+                "data": {"messages": [human, answer], "error": None},
+            }
+
+    events = []
+
+    async def send_event(event):
+        events.append(event)
+
+    new_messages = asyncio.run(chat_router._run_graph_and_stream(
+        FakeGraph(),
+        [human],
+        "human-1",
+        "deepseek-v4-flash",
+        "system",
+        send_event,
+        "user",
+        "conversation",
+        None,
+        "auto",
+    ))
+
+    assert new_messages == [answer]
+    assert events == [{
+        "type": "text_delta",
+        "messageId": "answer-1",
+        "delta": "world",
+    }]
+
+
 def test_prepare_turn_resets_all_coordination_state():
     assert nodes.prepare_turn_node(base_state(
         supervisor_decision={
@@ -160,6 +237,7 @@ def test_explicit_search_mode_is_assigned_to_research_without_router_llm(
     result = asyncio.run(supervisor.supervisor_node(
         base_state(messages=[HumanMessage(content="research this")]),
         runtime(search_mode=search_mode),
+        noop_writer,
     ))
     assert result["supervisor_decision"]["route"] == "research_agent"
     assert search_mode in result["supervisor_decision"]["reason"]
@@ -182,7 +260,9 @@ def test_supervisor_model_returns_an_auditable_assignment(monkeypatch, raw, expe
         "create_deepseek_chat",
         lambda *_args, **_kwargs: FakeSupervisor(),
     )
-    result = asyncio.run(supervisor.supervisor_node(base_state(), runtime()))
+    result = asyncio.run(supervisor.supervisor_node(
+        base_state(), runtime(), noop_writer
+    ))
     decision = result["supervisor_decision"]
     assert decision["route"] == expected
     assert decision["task"]
@@ -227,15 +307,13 @@ def test_general_agent_direct_result_is_internal_until_supervisor_finalizes(monk
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: FakeGeneral())
     events = []
 
-    async def callback(event):
-        events.append(event)
-
     result, trace = asyncio.run(general.run_general_agent(
         task="write",
         conversation_messages=[HumanMessage(content="write")],
         model_id="deepseek-v4-flash",
         system_prompt="",
-        context=runtime(callback).context,
+        context=runtime().context,
+        writer=events.append,
     ))
     assert result == "worker result"
     assert trace == []
@@ -273,6 +351,7 @@ def test_general_agent_can_call_tools_and_persist_the_trace(monkeypatch):
         model_id="deepseek-v4-flash",
         system_prompt="",
         context=runtime().context,
+        writer=noop_writer,
     ))
     assert result == "calculation result is 2"
     assert [type(message).__name__ for message in trace] == ["AIMessage", "ToolMessage"]
@@ -290,6 +369,7 @@ def test_general_agent_rejects_search_tools():
         }],
         model_id="deepseek-v4-flash",
         context=runtime().context,
+        writer=noop_writer,
     ))
     assert messages[0].status == "error"
     assert "只允许一个搜索任务" in json.loads(messages[0].content)["error"]
@@ -319,6 +399,7 @@ def test_general_agent_tool_loop_stops_with_only_complete_protocol_pairs(monkeyp
         model_id="deepseek-v4-flash",
         system_prompt="",
         context=runtime().context,
+        writer=noop_writer,
     ))
     assert "3 轮工具调用上限" in result
     assert len(trace) == 6
@@ -337,7 +418,7 @@ def test_general_agent_tool_loop_stops_with_only_complete_protocol_pairs(monkeyp
     [("web", "web_search"), ("deep", "deep_search"), ("auto", "deep_search")],
 )
 def test_research_agent_owns_fast_and_deep_search(monkeypatch, search_mode, expected_tool):
-    async def fake_execute(state, _context):
+    async def fake_execute(state, _context, _writer):
         call = state["messages"][-1].tool_calls[0]
         assert call["name"] == expected_tool
         output = {
@@ -365,6 +446,7 @@ def test_research_agent_owns_fast_and_deep_search(monkeypatch, search_mode, expe
             "reason": "needs research",
         }),
         runtime(search_mode=search_mode),
+        noop_writer,
     ))
     assert result["worker_result"] == "research brief [[cite:1]]"
     assert [type(message).__name__ for message in result["messages"]] == [
@@ -386,9 +468,6 @@ def test_supervisor_finalization_streams_one_user_facing_answer(monkeypatch):
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: llm)
     events = []
 
-    async def callback(event):
-        events.append(event)
-
     citations = [{
         "title": "Source",
         "url": "https://example.com",
@@ -405,7 +484,7 @@ def test_supervisor_finalization_streams_one_user_facing_answer(monkeypatch):
             worker_result="brief",
             source_citations=citations,
         ),
-        runtime(callback),
+        events.append,
     ))
     assert result["messages"][0].content == "integrated answer [[cite:1]]"
     assert result["completed_agents"] == ["research_agent", "supervisor"]
@@ -443,7 +522,8 @@ def test_full_supervisor_general_path(monkeypatch):
     )
     models = iter([GeneralWorker(), SupervisorFinal()])
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
-    result = asyncio.run(build_graph().ainvoke(
+    result, events = asyncio.run(collect_graph_stream(
+        build_graph(),
         {
             "messages": [HumanMessage(content="1+1?")],
             "model_id": "deepseek-v4-flash",
@@ -453,11 +533,15 @@ def test_full_supervisor_general_path(monkeypatch):
         },
         context=runtime().context,
     ))
+    assert not hasattr(runtime().context, "stream_callback")
     assert result["error"] is None
     assert [type(message).__name__ for message in result["messages"]] == [
         "HumanMessage", "AIMessage"
     ]
     assert result["messages"][-1].content == "1+1 等于 2。"
+    assert [event["type"] for event in events if event["type"].startswith("text_")] == [
+        "text_start", "text_delta", "text_end"
+    ]
 
 
 def test_full_supervisor_research_path_persists_search_trace(monkeypatch):
@@ -524,6 +608,7 @@ def test_deep_search_cache_hit_skips_research_graph(monkeypatch):
             "type": "tool_call",
         }])]),
         runtime(tool_cache=FakeCache()).context,
+        noop_writer,
     ))
     assert result["source_citations"][0]["title"] == "Cached"
 
@@ -538,6 +623,44 @@ def test_deep_search_query_and_source_bounds():
         {"title": "A2", "url": "https://example.com/a", "content": "duplicate"},
         {"title": "Bad", "url": "javascript:alert(1)", "content": "bad"},
     ]}])[0]["title"] == "A"
+
+
+def test_deep_search_subgraph_forwards_custom_events(monkeypatch):
+    class FakeDeepSearchGraph:
+        async def astream(self, _input, *, stream_mode, version):
+            assert stream_mode == ["values", "custom"]
+            assert version == "v2"
+            yield {
+                "type": "custom",
+                "ns": (),
+                "data": {
+                    "type": "activity",
+                    "kind": "searching",
+                    "message": "searching",
+                },
+            }
+            yield {
+                "type": "values",
+                "ns": (),
+                "data": {
+                    "query": "topic",
+                    "queries": ["topic"],
+                    "summary": "brief",
+                    "results": [],
+                },
+            }
+
+    monkeypatch.setattr(deep_search, "DEEP_SEARCH_GRAPH", FakeDeepSearchGraph())
+    events = []
+    result = asyncio.run(deep_search.run_deep_search_workflow(
+        query="topic",
+        focus="",
+        model_id="deepseek-v4-flash",
+        writer=events.append,
+    ))
+
+    assert result["summary"] == "brief"
+    assert events[0]["type"] == "activity"
 
 
 def test_supervisor_workflow_resumes_messages_by_thread_id(monkeypatch):

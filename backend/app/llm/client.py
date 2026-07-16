@@ -13,6 +13,7 @@ from app.config import (
     DeepSeekModelId,
     tools_enabled,
 )
+from app.observability import OBSERVABILITY_CALLBACK
 
 
 def create_deepseek_chat(
@@ -34,6 +35,7 @@ def create_deepseek_chat(
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
         temperature=temperature,
+        callbacks=[OBSERVABILITY_CALLBACK],
     )
 
     # deepseek-reasoner uses a separate reasoning_effort param

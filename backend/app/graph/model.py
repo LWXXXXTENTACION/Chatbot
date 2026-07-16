@@ -14,9 +14,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import BaseTool
+from langgraph.types import StreamWriter
 
 from app.config import CONTEXT_MAX_INPUT_TOKENS, DeepSeekModelId
-from app.graph.context import StreamCallback
 from app.graph.context_window import build_context_window
 from app.graph.events import StreamEvent
 from app.graph.state import AgentState
@@ -27,14 +27,12 @@ logger = logging.getLogger("chatbot.graph.model")
 FORCED_SEARCH_CALL_PREFIX = "forced_search_"
 
 
-async def emit(callback: StreamCallback | None, event: StreamEvent) -> None:
-    """Deliver one typed stream event when the request has a consumer."""
-    if callback is None:
-        return
+async def emit(writer: StreamWriter, event: StreamEvent) -> None:
+    """Publish one typed event through LangGraph's custom stream channel."""
     try:
-        await callback(event)
+        writer(event)
     except Exception:
-        logger.exception("Stream callback failed")
+        logger.exception("LangGraph custom stream writer failed")
 
 
 def message_text(message: BaseMessage) -> str:
@@ -144,7 +142,7 @@ def build_model_messages(
 async def stream_model_message(
     state: AgentState,
     *,
-    callback: StreamCallback | None,
+    writer: StreamWriter,
     system_prompts: Sequence[str],
     tools: Sequence[BaseTool] | None,
     attach_sources: bool,
@@ -173,11 +171,11 @@ async def stream_model_message(
         text = message_text(chunk)
         if text:
             if emit_text and not text_started:
-                await emit(callback, {"type": "text_start", "messageId": message_id})
+                await emit(writer, {"type": "text_start", "messageId": message_id})
                 text_started = True
             full_text += text
             if emit_text:
-                await emit(callback, {
+                await emit(writer, {
                     "type": "text_delta",
                     "messageId": message_id,
                     "delta": text,
@@ -186,11 +184,11 @@ async def stream_model_message(
         reasoning = getattr(chunk, "reasoning_content", None)
         if reasoning:
             if emit_reasoning and not reasoning_started:
-                await emit(callback, {"type": "reasoning_start", "messageId": message_id})
+                await emit(writer, {"type": "reasoning_start", "messageId": message_id})
                 reasoning_started = True
             full_reasoning += reasoning
             if emit_reasoning:
-                await emit(callback, {
+                await emit(writer, {
                     "type": "reasoning_delta",
                     "messageId": message_id,
                     "delta": reasoning,
@@ -212,7 +210,7 @@ async def stream_model_message(
             call_id = entry["id"] or f"call_{index}"
             if not entry["started"] and entry["name"]:
                 entry["started"] = True
-                await emit(callback, {
+                await emit(writer, {
                     "type": "tool_call_start",
                     "messageId": message_id,
                     "toolCallId": call_id,
@@ -221,22 +219,22 @@ async def stream_model_message(
             args_delta = str(call.get("args") or "")
             if args_delta:
                 entry["args_json"] += args_delta
-                await emit(callback, {
+                await emit(writer, {
                     "type": "tool_call_delta",
                     "toolCallId": call_id,
                     "delta": args_delta,
                 })
 
     if text_started:
-        await emit(callback, {"type": "text_end", "messageId": message_id})
+        await emit(writer, {"type": "text_end", "messageId": message_id})
     if reasoning_started:
-        await emit(callback, {"type": "reasoning_end", "messageId": message_id})
+        await emit(writer, {"type": "reasoning_end", "messageId": message_id})
 
     tool_calls: list[dict[str, Any]] = []
     for index in sorted(tool_calls_by_index):
         entry = tool_calls_by_index[index]
         call_id = entry["id"] or f"call_{index}"
-        await emit(callback, {"type": "tool_call_end", "toolCallId": call_id})
+        await emit(writer, {"type": "tool_call_end", "toolCallId": call_id})
         try:
             args = json.loads(entry["args_json"] or "{}")
         except json.JSONDecodeError:
@@ -254,7 +252,7 @@ async def stream_model_message(
     citations = state.get("source_citations", [])
     if attach_sources and full_text and not tool_calls and citations:
         additional_kwargs["sources"] = citations
-        await emit(callback, {
+        await emit(writer, {
             "type": "sources",
             "messageId": message_id,
             "sources": citations,

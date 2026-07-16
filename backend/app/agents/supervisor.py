@@ -8,6 +8,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
+from langgraph.types import StreamWriter
 
 from app.config import DeepSeekModelId
 from app.graph.context import AgentRuntimeContext
@@ -92,11 +93,12 @@ def _parse_decision(raw: str, request: str) -> SupervisorDecision:
 async def supervisor_node(
     state: AgentState,
     runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Analyze the current request and assign exactly one specialized worker."""
     context = runtime.context
     request = _latest_user_request(state)
-    await emit(context.stream_callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "analyzing",
         "message": "Supervisor 正在分析并分派任务",
@@ -126,7 +128,7 @@ async def supervisor_node(
                 "reason": "Supervisor 调用失败，已按任务特征安全回退",
             }
 
-    await emit(context.stream_callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "analyzing",
         "message": f"Supervisor 已分派给 {decision['route']}：{decision['reason']}",
@@ -139,7 +141,7 @@ async def supervisor_node(
 
 async def supervisor_finalize_node(
     state: AgentState,
-    runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Integrate the delegated worker result into the user-facing answer."""
     if state.get("error"):
@@ -151,7 +153,7 @@ async def supervisor_finalize_node(
         f"分派任务：{decision['task'] if decision else _latest_user_request(state)}\n"
         f"Worker 结果：\n{worker_result or 'Worker 未返回文本结果，请根据已有工具消息说明限制。'}"
     )
-    await emit(runtime.context.stream_callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "answering",
         "message": "Supervisor 正在整合 Worker 结果",
@@ -159,7 +161,7 @@ async def supervisor_finalize_node(
     try:
         message = await stream_model_message(
             state,
-            callback=runtime.context.stream_callback,
+            writer=writer,
             system_prompts=[SUPERVISOR_FINAL_PROMPT, integration_context],
             tools=None,
             attach_sources=True,

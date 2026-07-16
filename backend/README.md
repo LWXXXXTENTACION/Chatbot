@@ -158,9 +158,10 @@ restoration.
 
 Authenticated conversations compile the main graph once with
 `AsyncSqliteSaver`. The conversation ID is the LangGraph `thread_id`.
-`prepare_turn` clears turn-local fields after checkpoint restoration. Stream
-callbacks, search mode, and cache clients are `AgentRuntimeContext`; they are
-request-scoped dependencies and are never serialized into checkpoints.
+`prepare_turn` clears turn-local fields after checkpoint restoration. Search
+mode and cache clients are request-scoped `AgentRuntimeContext` dependencies
+and are never serialized into checkpoints. Streaming is graph-native: nodes
+receive LangGraph's injected `StreamWriter` and publish typed `custom` events.
 
 Before the Supervisor runs, `context_manager` applies five ordered pressure
 strategies. Ratios are measured against `CONTEXT_MAX_INPUT_TOKENS`:
@@ -200,7 +201,8 @@ Browser useChatStream
   → compare history with the conversation checkpoint
       ├─ synchronized: invoke graph with only the new HumanMessage
       └─ divergent: delete checkpoint and rebuild from business history
-  → graph.ainvoke(AgentInput, thread_id=conversation_id, runtime context)
+  → graph.astream(AgentInput, thread_id=conversation_id,
+                  stream_mode=["values", "custom"], version="v2")
   → prepare_turn clears previous coordination state
   → context_manager estimates tokens and applies zero or more compression strategies
       ├─ updates checkpoint messages with same-ID replacements / RemoveMessage
@@ -212,8 +214,8 @@ Browser useChatStream
       └─ Research Agent: fast search or deep-search DAG
   → Worker returns result + persistable tool trace to shared state
   → Supervisor integrates one final user-facing answer
-  → graph nodes emit typed events into an asyncio queue
-  → FastAPI encodes queue events as POST SSE
+  → graph nodes publish typed events through LangGraph's custom stream
+  → FastAPI consumes custom events and encodes them as POST SSE
   → Next.js pipes bytes without transforming them
   → useChatStream reduces events into UI message parts
   → completed AI/Tool messages are committed to chatbot.db

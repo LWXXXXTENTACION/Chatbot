@@ -9,10 +9,9 @@ from urllib.parse import urldefrag
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.runtime import Runtime
+from langgraph.types import StreamWriter
 
 from app.config import DeepSeekModelId
-from app.graph.context import AgentRuntimeContext
 from app.graph.model import emit, message_text
 from app.graph.state import SourceCitation
 from app.llm.client import create_deepseek_chat
@@ -121,12 +120,11 @@ async def plan_queries_node(state: DeepSearchState) -> dict[str, Any]:
 
 async def search_sources_node(
     state: DeepSearchState,
-    runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Run the planned searches concurrently and normalize their sources."""
     queries = state.get("queries", []) or [state["query"]]
-    callback = runtime.context.stream_callback
-    await emit(callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "searching",
         "message": f"深度搜索：并行检索 {len(queries)} 个方向",
@@ -137,7 +135,7 @@ async def search_sources_node(
     )
     outputs = [output for output in raw_outputs if isinstance(output, dict)]
     sources = dedupe_sources(outputs)
-    await emit(callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "retrieved",
         "message": f"已整理 {len(sources)} 个不重复来源",
@@ -147,7 +145,7 @@ async def search_sources_node(
 
 async def synthesize_brief_node(
     state: DeepSearchState,
-    runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Create a citation-ready brief from only the collected evidence."""
     sources = state.get("results", [])
@@ -156,8 +154,7 @@ async def synthesize_brief_node(
             "summary": "没有检索到可用来源。请明确说明无法从搜索结果核验信息。",
         }
 
-    callback = runtime.context.stream_callback
-    await emit(callback, {
+    await emit(writer, {
         "type": "activity",
         "kind": "analyzing",
         "message": "深度搜索工作流正在交叉整理证据",
@@ -193,7 +190,6 @@ def build_deep_search_graph():
     """Compile the stateless plan → search → synthesize research DAG."""
     graph = StateGraph(
         DeepSearchState,
-        context_schema=AgentRuntimeContext,
         input_schema=DeepSearchInput,
         output_schema=DeepSearchOutput,
     )
@@ -215,13 +211,21 @@ async def run_deep_search_workflow(
     query: str,
     focus: str,
     model_id: DeepSeekModelId,
-    context: AgentRuntimeContext,
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Invoke the inspectable research DAG and expose its stable tool output."""
-    result = await DEEP_SEARCH_GRAPH.ainvoke(
+    result: dict[str, Any] | None = None
+    async for part in DEEP_SEARCH_GRAPH.astream(
         {"query": query, "focus": focus, "model_id": model_id},
-        context=context,
-    )
+        stream_mode=["values", "custom"],
+        version="v2",
+    ):
+        if part["type"] == "custom":
+            writer(part["data"])
+        elif part["type"] == "values":
+            result = part["data"]
+    if result is None:
+        raise RuntimeError("Deep-search graph completed without a final state")
     return {
         "query": result["query"],
         "queries": result.get("queries", [query]),

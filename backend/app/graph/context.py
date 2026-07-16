@@ -1,12 +1,10 @@
-"""Transient dependencies supplied to graph nodes without checkpointing them."""
+"""Request-scoped dependencies supplied to graph nodes."""
 
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Literal, cast
+from typing import Literal, cast
 
 from app.cache import ToolCache
-from app.graph.events import StreamEvent
 
-StreamCallback = Callable[[StreamEvent], Awaitable[None]]
 SearchMode = Literal["auto", "web", "deep"]
 
 
@@ -16,6 +14,5 @@ def normalize_search_mode(value: object) -> SearchMode:
 
 @dataclass
 class AgentRuntimeContext:
-    stream_callback: StreamCallback | None = None
     tool_cache: ToolCache | None = None
     search_mode: SearchMode = "auto"

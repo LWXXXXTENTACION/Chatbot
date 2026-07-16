@@ -407,6 +407,11 @@ export function useChatStream({
         break;
       }
 
+      case "trace_summary":
+        // Persisted by the backend and consumed by the observability page.
+        // The chat surface intentionally stays focused on the answer.
+        break;
+
       case "done": {
         // Finalize whatever message is currently streaming.
         // The done event's messageId is from the graph runner, not the

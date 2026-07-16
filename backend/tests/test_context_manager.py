@@ -1,12 +1,10 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 from langgraph.graph.message import add_messages
 
 from app.graph import context_manager
-from app.graph.context import AgentRuntimeContext
 from app.graph.context_manager import ContextPolicy, manage_context
 
 
@@ -35,12 +33,8 @@ def state(messages, **overrides):
     return value
 
 
-def runtime(events=None):
-    async def callback(event):
-        if events is not None:
-            events.append(event)
-
-    return SimpleNamespace(context=AgentRuntimeContext(stream_callback=callback))
+def noop_writer(_event):
+    return None
 
 
 def turn(index: int, words: int = 40):
@@ -75,7 +69,7 @@ def test_microcompact_expires_tool_payload_without_breaking_protocol():
 
     update = asyncio.run(manage_context(
         state(messages),
-        runtime(),
+        writer=noop_writer,
         policy=ContextPolicy(max_tokens=10_000, microcompact_ttl_seconds=60),
         now=NOW,
     ))
@@ -99,7 +93,7 @@ def test_context_collapse_updates_summary_and_session_memory(monkeypatch):
     events = []
     update = asyncio.run(manage_context(
         state(messages),
-        runtime(events),
+        writer=events.append,
         policy=ContextPolicy(
             max_tokens=10_000,
             session_memory_ratio=0.01,
@@ -130,7 +124,7 @@ def test_full_compact_then_ptl_keeps_latest_complete_turn(monkeypatch):
     messages = [message for index in range(4) for message in turn(index, 500)]
     update = asyncio.run(manage_context(
         state(messages),
-        runtime(),
+        writer=noop_writer,
         policy=ContextPolicy(
             max_tokens=200,
             session_memory_ratio=0.01,

@@ -1,11 +1,12 @@
 """Transient dependencies supplied to graph nodes without checkpointing them."""
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Literal, cast
+from typing import Awaitable, Callable, Literal, cast
 
 from app.cache import ToolCache
+from app.graph.events import StreamEvent
 
-StreamCallback = Callable[[dict[str, Any]], Awaitable[None]]
+StreamCallback = Callable[[StreamEvent], Awaitable[None]]
 SearchMode = Literal["auto", "web", "deep"]
 
 

@@ -3,25 +3,16 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import (
-    AIMessage,
-    AIMessageChunk,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from app.graph import nodes
+from app.agents import general, research, supervisor
+from app.cache import CacheLookup
+from app.graph import deep_search, model as graph_model, nodes, tool_execution
 from app.graph.builder import build_graph
 from app.graph.context import AgentRuntimeContext
-from app.graph.deep_search import dedupe_sources, parse_search_queries
-from app.cache import CacheLookup
-from app.tools import (
-    DEEP_SEARCH_MODE_TOOLS,
-    DEEP_SEARCH_TOOLS,
-    FAST_SEARCH_TOOLS,
-    MAIN_AGENT_TOOLS,
-)
+from app.graph.routing import route_supervisor
+from app.tools import GENERAL_AGENT_TOOLS, RESEARCH_AGENT_TOOLS
 
 
 def base_state(**overrides):
@@ -31,10 +22,11 @@ def base_state(**overrides):
         "system_prompt": "",
         "user_id": "user",
         "conversation_id": "conversation",
+        "supervisor_decision": None,
+        "active_agent": None,
+        "completed_agents": [],
+        "worker_result": "",
         "source_citations": [],
-        "retrieved_docs": "",
-        "search_iteration": 0,
-        "search_history": [],
         "error": None,
     }
     state.update(overrides)
@@ -51,300 +43,339 @@ def runtime(callback=None, tool_cache=None, search_mode="auto"):
     )
 
 
-def test_graph_has_one_main_agent_and_one_tool_node():
+def _assert_acyclic(graph) -> None:
+    adjacency: dict[str, list[str]] = {}
+    for edge in graph.edges:
+        adjacency.setdefault(edge.source, []).append(edge.target)
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        assert node not in visiting, f"cycle detected at {node}"
+        if node in visited:
+            return
+        visiting.add(node)
+        for target in adjacency.get(node, []):
+            visit(target)
+        visiting.remove(node)
+        visited.add(node)
+
+    visit("__start__")
+
+
+def test_main_graph_is_a_supervisor_workflow():
     graph = build_graph().get_graph()
-    assert set(graph.nodes) == {"__start__", "main_agent", "tools", "__end__"}
+    assert set(graph.nodes) == {
+        "__start__",
+        "prepare_turn",
+        "supervisor",
+        "general_agent",
+        "research_agent",
+        "supervisor_finalize",
+        "__end__",
+    }
+    edges = {(edge.source, edge.target) for edge in graph.edges}
+    assert ("supervisor", "general_agent") in edges
+    assert ("supervisor", "research_agent") in edges
+    assert ("general_agent", "supervisor_finalize") in edges
+    assert ("research_agent", "supervisor_finalize") in edges
+    assert ("supervisor_finalize", "__end__") in edges
+    _assert_acyclic(graph)
 
 
-def test_main_agent_requires_sentence_level_clickable_citations():
-    prompt = nodes.MAIN_AGENT_SYSTEM_PROMPT
-    assert "每个依赖来源的事实句" in prompt
-    assert "句末标点前" in prompt
-    assert "[[cite:1]]" in prompt
-    assert "前端会把引用编号转换成可点击来源链接" in prompt
+def test_general_agent_has_one_bounded_tool_loop():
+    graph = general.GENERAL_AGENT_GRAPH.get_graph()
+    assert set(graph.nodes) == {
+        "__start__", "prepare", "agent", "tools", "tool_limit", "__end__"
+    }
+    edges = {(edge.source, edge.target) for edge in graph.edges}
+    assert ("tools", "agent") in edges
+    assert general.MAX_TOOL_ROUNDS == 3
 
 
-def test_main_agent_cannot_call_raw_web_search():
-    assert [tool.name for tool in MAIN_AGENT_TOOLS] == [
-        "get_weather",
-        "calculate",
-        "create_artifact",
-        "deep_search",
+def test_deep_search_is_an_inspectable_acyclic_workflow():
+    graph = deep_search.DEEP_SEARCH_GRAPH.get_graph()
+    assert set(graph.nodes) == {
+        "__start__",
+        "plan_queries",
+        "search_sources",
+        "synthesize_brief",
+        "__end__",
+    }
+    _assert_acyclic(graph)
+
+
+def test_backend_exposes_only_the_authenticated_chat_transport():
+    from app.routers.chat import router
+
+    routes = {
+        (getattr(route, "path", ""), method)
+        for route in router.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert ("/api/chat/stream", "POST") in routes
+    assert not any(path in {"/chat/stream", "/ws"} for path, _method in routes)
+
+
+def test_prepare_turn_resets_all_coordination_state():
+    assert nodes.prepare_turn_node(base_state(
+        supervisor_decision={
+            "route": "research_agent",
+            "task": "old",
+            "reason": "old",
+        },
+        active_agent="research_agent",
+        completed_agents=["research_agent"],
+        worker_result="old result",
+        source_citations=[{"title": "old", "url": "https://old", "content": "old"}],
+        error="old error",
+    )) == {
+        "supervisor_decision": None,
+        "active_agent": None,
+        "completed_agents": [],
+        "worker_result": "",
+        "source_citations": [],
+        "error": None,
+    }
+
+
+@pytest.mark.parametrize("search_mode", ["web", "deep"])
+def test_explicit_search_mode_is_assigned_to_research_without_router_llm(
+    monkeypatch,
+    search_mode,
+):
+    monkeypatch.setattr(
+        supervisor,
+        "create_deepseek_chat",
+        lambda *_args, **_kwargs: pytest.fail("explicit search must route deterministically"),
+    )
+    result = asyncio.run(supervisor.supervisor_node(
+        base_state(messages=[HumanMessage(content="research this")]),
+        runtime(search_mode=search_mode),
+    ))
+    assert result["supervisor_decision"]["route"] == "research_agent"
+    assert search_mode in result["supervisor_decision"]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"route":"general_agent","task":"calculate","reason":"math"}', "general_agent"),
+        ('{"route":"research_agent","task":"latest news","reason":"current"}', "research_agent"),
+    ],
+)
+def test_supervisor_model_returns_an_auditable_assignment(monkeypatch, raw, expected):
+    class FakeSupervisor:
+        async def ainvoke(self, _messages):
+            return AIMessage(content=raw)
+
+    monkeypatch.setattr(
+        supervisor,
+        "create_deepseek_chat",
+        lambda *_args, **_kwargs: FakeSupervisor(),
+    )
+    result = asyncio.run(supervisor.supervisor_node(base_state(), runtime()))
+    decision = result["supervisor_decision"]
+    assert decision["route"] == expected
+    assert decision["task"]
+    assert decision["reason"]
+
+
+def test_supervisor_has_a_deterministic_parse_fallback():
+    research_decision = supervisor._parse_decision("not json", "帮我搜索最新新闻")
+    general_decision = supervisor._parse_decision("not json", "计算 1+1")
+    assert research_decision["route"] == "research_agent"
+    assert general_decision["route"] == "general_agent"
+
+
+def test_supervisor_router_uses_only_the_declared_assignment():
+    assert route_supervisor(base_state(supervisor_decision={
+        "route": "research_agent",
+        "task": "topic",
+        "reason": "needs sources",
+    })) == "research_agent"
+    assert route_supervisor(base_state(supervisor_decision={
+        "route": "general_agent",
+        "task": "write",
+        "reason": "no research",
+    })) == "general_agent"
+
+
+def test_tool_ownership_is_separated_between_workers():
+    assert [tool.name for tool in GENERAL_AGENT_TOOLS] == [
+        "get_weather", "calculate", "create_artifact"
     ]
-    assert [tool.name for tool in DEEP_SEARCH_TOOLS] == ["web_search"]
-    assert [tool.name for tool in FAST_SEARCH_TOOLS] == [
-        "get_weather",
-        "calculate",
-        "create_artifact",
-        "web_search",
-    ]
-    assert [tool.name for tool in DEEP_SEARCH_MODE_TOOLS] == [
-        "get_weather",
-        "calculate",
-        "create_artifact",
-        "deep_search",
+    assert [tool.name for tool in RESEARCH_AGENT_TOOLS] == ["web_search", "deep_search"]
+
+
+def test_general_agent_direct_result_is_internal_until_supervisor_finalizes(monkeypatch):
+    class FakeGeneral:
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="worker result")
+
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: FakeGeneral())
+    events = []
+
+    async def callback(event):
+        events.append(event)
+
+    result, trace = asyncio.run(general.run_general_agent(
+        task="write",
+        conversation_messages=[HumanMessage(content="write")],
+        model_id="deepseek-v4-flash",
+        system_prompt="",
+        context=runtime(callback).context,
+    ))
+    assert result == "worker result"
+    assert trace == []
+    assert not any(event["type"].startswith("text_") for event in events)
+
+
+def test_general_agent_can_call_tools_and_persist_the_trace(monkeypatch):
+    class ToolDecision:
+        def bind_tools(self, tools):
+            assert [tool.name for tool in tools] == [
+                "get_weather", "calculate", "create_artifact"
+            ]
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="", tool_call_chunks=[{
+                "id": "calc-call",
+                "name": "calculate",
+                "args": '{"expression":"1+1"}',
+                "index": 0,
+            }])
+
+    class ToolAnswer:
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="calculation result is 2")
+
+    models = iter([ToolDecision(), ToolAnswer()])
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
+    result, trace = asyncio.run(general.run_general_agent(
+        task="calculate 1+1",
+        conversation_messages=[HumanMessage(content="calculate 1+1")],
+        model_id="deepseek-v4-flash",
+        system_prompt="",
+        context=runtime().context,
+    ))
+    assert result == "calculation result is 2"
+    assert [type(message).__name__ for message in trace] == ["AIMessage", "ToolMessage"]
+    assert trace[0].tool_calls[0]["name"] == "calculate"
+    assert json.loads(trace[1].content)["result"] == 2
+
+
+def test_general_agent_rejects_search_tools():
+    messages = asyncio.run(tool_execution.execute_general_tool_batch(
+        [{
+            "id": "search-call",
+            "name": "deep_search",
+            "args": {"query": "topic"},
+            "type": "tool_call",
+        }],
+        model_id="deepseek-v4-flash",
+        context=runtime().context,
+    ))
+    assert messages[0].status == "error"
+    assert "只允许一个搜索任务" in json.loads(messages[0].content)["error"]
+
+
+def test_general_agent_tool_loop_stops_with_only_complete_protocol_pairs(monkeypatch):
+    class RepeatingToolCall:
+        def __init__(self, index):
+            self.index = index
+
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="", tool_call_chunks=[{
+                "id": f"calc-{self.index}",
+                "name": "calculate",
+                "args": '{"expression":"1+1"}',
+                "index": 0,
+            }])
+
+    models = iter(RepeatingToolCall(index) for index in range(4))
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
+    result, trace = asyncio.run(general.run_general_agent(
+        task="keep calculating",
+        conversation_messages=[HumanMessage(content="calculate")],
+        model_id="deepseek-v4-flash",
+        system_prompt="",
+        context=runtime().context,
+    ))
+    assert "3 轮工具调用上限" in result
+    assert len(trace) == 6
+    assert [type(message).__name__ for message in trace] == [
+        "AIMessage",
+        "ToolMessage",
+        "AIMessage",
+        "ToolMessage",
+        "AIMessage",
+        "ToolMessage",
     ]
 
 
 @pytest.mark.parametrize(
     ("search_mode", "expected_tool"),
-    [("web", "web_search"), ("deep", "deep_search")],
+    [("web", "web_search"), ("deep", "deep_search"), ("auto", "deep_search")],
 )
-def test_explicit_search_mode_creates_the_selected_tool_call_without_llm(
-    monkeypatch,
-    search_mode,
-    expected_tool,
-):
-    monkeypatch.setattr(
-        nodes,
-        "create_deepseek_chat",
-        lambda _model: pytest.fail("explicit search must not call the LLM first"),
-    )
-    events = []
-
-    async def callback(event):
-        events.append(event)
-
-    result = asyncio.run(nodes.chat_node(
-        base_state(messages=[HumanMessage(content="current question")]),
-        runtime(callback, search_mode=search_mode),
-    ))
-
-    message = result["messages"][0]
-    assert message.tool_calls[0]["name"] == expected_tool
-    assert message.tool_calls[0]["args"]["query"] == "current question"
-    assert message.tool_calls[0]["id"].startswith(nodes.FORCED_SEARCH_CALL_PREFIX)
-    assert [event["type"] for event in events] == [
-        "tool_call_start",
-        "tool_call_delta",
-        "tool_call_end",
-    ]
-
-
-def test_explicit_search_followup_never_sends_tool_choice(monkeypatch):
-    class FakeLlm:
-        def __init__(self):
-            self.bind_kwargs = None
-            self.tools = []
-            self.messages = []
-
-        def bind_tools(self, tools, **kwargs):
-            self.tools = tools
-            self.bind_kwargs = kwargs
-            return self
-
-        async def astream(self, messages):
-            self.messages = messages
-            yield AIMessageChunk(content="final answer")
-
-    llm = FakeLlm()
-    monkeypatch.setattr(nodes, "create_deepseek_chat", lambda _model: llm)
-
-    call_id = f"{nodes.FORCED_SEARCH_CALL_PREFIX}test"
-    asyncio.run(nodes.chat_node(
-        base_state(
-            search_iteration=1,
-            messages=[
-                HumanMessage(content="btc"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{
-                        "id": call_id,
-                        "name": "web_search",
-                        "args": {"query": "btc"},
-                        "type": "tool_call",
-                    }],
-                ),
-                ToolMessage(
-                    content=json.dumps({
-                        "query": "btc",
-                        "results": [{
-                            "title": "Bitcoin",
-                            "url": "https://example.com/btc",
-                            "content": "evidence",
-                        }],
-                    }),
-                    tool_call_id=call_id,
-                    name="web_search",
-                ),
-            ],
-        ),
-        runtime(search_mode="web"),
-    ))
-
-    assert llm.bind_kwargs == {}
-    assert [tool.name for tool in llm.tools] == [
-        "get_weather",
-        "calculate",
-        "create_artifact",
-    ]
-    assert not any(
-        isinstance(message, ToolMessage)
-        or isinstance(message, AIMessage) and message.tool_calls
-        for message in llm.messages
-    )
-    evidence_message = next(
-        message
-        for message in llm.messages
-        if isinstance(message, SystemMessage) and "本回合搜索证据" in str(message.content)
-    )
-    assert '"query": "btc"' in str(evidence_message.content)
-
-
-def test_fast_web_search_emits_sanitized_sources(monkeypatch):
-    class FakeWebSearch:
-        async def ainvoke(self, args):
-            return {
-                "query": args["query"],
-                "results": [
-                    {
-                        "title": "Primary",
-                        "url": "https://example.com/source#details",
-                        "content": "Evidence",
-                    },
-                    {
-                        "title": "Unsafe",
-                        "url": "javascript:alert(1)",
-                        "content": "Ignore",
-                    },
-                ],
-            }
-
-    monkeypatch.setitem(nodes.TOOL_MAP, "web_search", FakeWebSearch())
-    call = {
-        "id": "web-call",
-        "name": "web_search",
-        "args": {"query": "latest topic"},
-        "type": "tool_call",
-    }
-    events = []
-
-    async def callback(event):
-        events.append(event)
-
-    result = asyncio.run(nodes.custom_tool_node(
-        base_state(messages=[AIMessage(content="", tool_calls=[call])]),
-        runtime(callback, search_mode="web"),
-    ))
-
-    assert result["search_iteration"] == 1
-    assert result["source_citations"] == [{
-        "title": "Primary",
-        "url": "https://example.com/source#details",
-        "content": "Evidence",
-        "score": 0,
-    }]
-    assert next(event for event in events if event["type"] == "tool_result")["cached"] is False
-
-
-def test_query_parser_and_source_deduplication_are_bounded():
-    assert parse_search_queries('["alpha", "Alpha", "beta", "gamma"]', "fallback") == [
-        "alpha",
-        "beta",
-        "gamma",
-    ]
-    sources = dedupe_sources([
-        {"results": [
-            {"title": "A", "url": "https://example.com/a#section", "content": "one"},
-            {"title": "A2", "url": "https://example.com/a", "content": "duplicate"},
-            {"title": "Bad", "url": "javascript:alert(1)", "content": "bad"},
-        ]},
-    ])
-    assert sources == [{
-        "title": "A",
-        "url": "https://example.com/a#section",
-        "content": "one",
-        "score": 0,
-    }]
-
-
-def test_deep_search_runs_at_most_once_per_turn(monkeypatch):
-    calls = 0
-
-    async def fake_search(query, focus, model_id, callback):
-        nonlocal calls
-        calls += 1
-        return {
-            "query": query,
-            "queries": [query],
-            "summary": "evidence [[cite:1]]",
+def test_research_agent_owns_fast_and_deep_search(monkeypatch, search_mode, expected_tool):
+    async def fake_execute(state, _context):
+        call = state["messages"][-1].tool_calls[0]
+        assert call["name"] == expected_tool
+        output = {
+            "summary": "research brief [[cite:1]]",
             "results": [{
                 "title": "Source",
                 "url": "https://example.com",
                 "content": "Evidence",
-                "score": 0,
             }],
         }
+        return {
+            "messages": [ToolMessage(
+                content=json.dumps(output),
+                tool_call_id=call["id"],
+                name=call["name"],
+            )],
+            "source_citations": output["results"],
+        }
 
-    monkeypatch.setattr(nodes, "deep_search_agent", fake_search)
-    tool_call = {
-        "id": "call-1",
-        "name": "deep_search",
-        "args": {"query": "topic"},
-        "type": "tool_call",
-    }
-    first_state = base_state(messages=[AIMessage(content="", tool_calls=[tool_call])])
-    first = asyncio.run(nodes.custom_tool_node(first_state, runtime()))
-    assert calls == 1
-    assert first["search_iteration"] == 1
-    assert first["source_citations"][0]["url"] == "https://example.com"
-
-    second_state = base_state(
-        messages=[AIMessage(content="", tool_calls=[tool_call])],
-        search_iteration=1,
-        source_citations=first["source_citations"],
-    )
-    second = asyncio.run(nodes.custom_tool_node(second_state, runtime()))
-    assert calls == 1
-    assert "最多运行一次" in json.loads(second["messages"][0].content)["error"]
-
-
-def test_deep_search_cache_hit_skips_delegate(monkeypatch):
-    async def should_not_run(**_kwargs):
-        raise AssertionError("deep-search delegate should be skipped on a cache hit")
-
-    class FakeCache:
-        async def get(self, name, args, model_id=""):
-            assert name == "deep_search"
-            assert model_id == "deepseek-v4-flash"
-            return CacheLookup(True, {
-                "queries": [args["query"]],
-                "summary": "cached [[cite:1]]",
-                "results": [{"title": "Cached", "url": "https://example.com", "content": "evidence"}],
-            })
-
-        async def put(self, *_args, **_kwargs):
-            raise AssertionError("cache hit must not write")
-
-    monkeypatch.setattr(nodes, "deep_search_agent", should_not_run)
-    tool_call = {
-        "id": "cached-call",
-        "name": "deep_search",
-        "args": {"query": "cached topic"},
-        "type": "tool_call",
-    }
-    events = []
-
-    async def callback(event):
-        events.append(event)
-
-    result = asyncio.run(nodes.custom_tool_node(
-        base_state(messages=[AIMessage(content="", tool_calls=[tool_call])]),
-        runtime(callback, FakeCache()),
+    monkeypatch.setattr(research, "execute_tool_batch", fake_execute)
+    result = asyncio.run(research.research_worker_node(
+        base_state(supervisor_decision={
+            "route": "research_agent",
+            "task": "topic",
+            "reason": "needs research",
+        }),
+        runtime(search_mode=search_mode),
     ))
-    assert result["source_citations"][0]["title"] == "Cached"
-    assert next(event for event in events if event["type"] == "tool_result")["cached"] is True
+    assert result["worker_result"] == "research brief [[cite:1]]"
+    assert [type(message).__name__ for message in result["messages"]] == [
+        "AIMessage", "ToolMessage"
+    ]
+    assert result["completed_agents"] == ["research_agent"]
 
 
-def test_sources_event_is_bound_to_final_answer(monkeypatch):
-    class FakeLlm:
+def test_supervisor_finalization_streams_one_user_facing_answer(monkeypatch):
+    class FakeFinal:
         def bind_tools(self, _tools):
-            return self
+            raise AssertionError("Supervisor finalization cannot bind tools")
 
-        async def astream(self, _messages):
-            yield AIMessageChunk(content="重要结论 [[cite:1]]")
+        async def astream(self, messages):
+            self.messages = messages
+            yield AIMessageChunk(content="integrated answer [[cite:1]]")
 
-    monkeypatch.setattr(nodes, "create_deepseek_chat", lambda _model: FakeLlm())
+    llm = FakeFinal()
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: llm)
     events = []
 
     async def callback(event):
@@ -354,14 +385,207 @@ def test_sources_event_is_bound_to_final_answer(monkeypatch):
         "title": "Source",
         "url": "https://example.com",
         "content": "Evidence",
-        "score": 0,
     }]
-    result = asyncio.run(nodes.chat_node(
-        base_state(source_citations=citations),
+    result = asyncio.run(supervisor.supervisor_finalize_node(
+        base_state(
+            supervisor_decision={
+                "route": "research_agent",
+                "task": "topic",
+                "reason": "research",
+            },
+            completed_agents=["research_agent"],
+            worker_result="brief",
+            source_citations=citations,
+        ),
         runtime(callback),
     ))
-    answer = result["messages"][0]
-    source_event = next(event for event in events if event["type"] == "sources")
-    text_event = next(event for event in events if event["type"] == "text_start")
-    assert source_event["messageId"] == text_event["messageId"]
-    assert answer.additional_kwargs["sources"] == citations
+    assert result["messages"][0].content == "integrated answer [[cite:1]]"
+    assert result["completed_agents"] == ["research_agent", "supervisor"]
+    assert any(
+        isinstance(message, SystemMessage) and "Worker 结果：\nbrief" in str(message.content)
+        for message in llm.messages
+    )
+    assert [event["type"] for event in events if event["type"] == "sources"] == ["sources"]
+
+
+def test_full_supervisor_general_path(monkeypatch):
+    class FakeSupervisor:
+        async def ainvoke(self, _messages):
+            return AIMessage(content=json.dumps({
+                "route": "general_agent",
+                "task": "calculate 1+1",
+                "reason": "math task",
+            }))
+
+    class GeneralWorker:
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="worker says 2")
+
+    class SupervisorFinal:
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="1+1 等于 2。")
+
+    monkeypatch.setattr(
+        supervisor,
+        "create_deepseek_chat",
+        lambda *_args, **_kwargs: FakeSupervisor(),
+    )
+    models = iter([GeneralWorker(), SupervisorFinal()])
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
+    result = asyncio.run(build_graph().ainvoke(
+        {
+            "messages": [HumanMessage(content="1+1?")],
+            "model_id": "deepseek-v4-flash",
+            "system_prompt": "",
+            "user_id": "user",
+            "conversation_id": "conversation",
+        },
+        context=runtime().context,
+    ))
+    assert result["error"] is None
+    assert [type(message).__name__ for message in result["messages"]] == [
+        "HumanMessage", "AIMessage"
+    ]
+    assert result["messages"][-1].content == "1+1 等于 2。"
+
+
+def test_full_supervisor_research_path_persists_search_trace(monkeypatch):
+    async def fake_deep_search(**_kwargs):
+        return {
+            "query": "topic",
+            "queries": ["topic"],
+            "summary": "brief [[cite:1]]",
+            "results": [{
+                "title": "Source",
+                "url": "https://example.com",
+                "content": "Evidence",
+            }],
+        }
+
+    class SupervisorFinal:
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="research answer [[cite:1]]")
+
+    monkeypatch.setattr(tool_execution, "run_deep_search_workflow", fake_deep_search)
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: SupervisorFinal())
+    result = asyncio.run(build_graph().ainvoke(
+        {
+            "messages": [HumanMessage(content="research topic")],
+            "model_id": "deepseek-v4-flash",
+            "system_prompt": "",
+            "user_id": "user",
+            "conversation_id": "conversation",
+        },
+        context=runtime(search_mode="deep").context,
+    ))
+    assert result["error"] is None
+    assert [type(message).__name__ for message in result["messages"]] == [
+        "HumanMessage", "AIMessage", "ToolMessage", "AIMessage"
+    ]
+    assert result["messages"][1].tool_calls[0]["name"] == "deep_search"
+    assert result["messages"][-1].additional_kwargs["sources"][0]["title"] == "Source"
+
+
+def test_deep_search_cache_hit_skips_research_graph(monkeypatch):
+    async def should_not_run(**_kwargs):
+        raise AssertionError("deep-search graph should be skipped on cache hit")
+
+    class FakeCache:
+        async def get(self, name, args, model_id=""):
+            return CacheLookup(True, {
+                "summary": "cached [[cite:1]]",
+                "results": [{
+                    "title": "Cached",
+                    "url": "https://example.com",
+                    "content": "evidence",
+                }],
+            })
+
+        async def put(self, *_args, **_kwargs):
+            raise AssertionError("cache hit must not write")
+
+    monkeypatch.setattr(tool_execution, "run_deep_search_workflow", should_not_run)
+    result = asyncio.run(tool_execution.execute_tool_batch(
+        base_state(messages=[AIMessage(content="", tool_calls=[{
+            "id": "cached-call",
+            "name": "deep_search",
+            "args": {"query": "cached topic"},
+            "type": "tool_call",
+        }])]),
+        runtime(tool_cache=FakeCache()).context,
+    ))
+    assert result["source_citations"][0]["title"] == "Cached"
+
+
+def test_deep_search_query_and_source_bounds():
+    assert deep_search.parse_search_queries(
+        '["alpha", "Alpha", "beta", "gamma"]',
+        "fallback",
+    ) == ["alpha", "beta", "gamma"]
+    assert deep_search.dedupe_sources([{"results": [
+        {"title": "A", "url": "https://example.com/a#section", "content": "one"},
+        {"title": "A2", "url": "https://example.com/a", "content": "duplicate"},
+        {"title": "Bad", "url": "javascript:alert(1)", "content": "bad"},
+    ]}])[0]["title"] == "A"
+
+
+def test_supervisor_workflow_resumes_messages_by_thread_id(monkeypatch):
+    class FakeSupervisor:
+        async def ainvoke(self, _messages):
+            return AIMessage(content=(
+                '{"route":"general_agent","task":"answer",'
+                '"reason":"general"}'
+            ))
+
+    class Worker:
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, messages):
+            count = sum(isinstance(message, HumanMessage) for message in messages)
+            yield AIMessageChunk(content=f"worker-{count}")
+
+    class Final:
+        async def astream(self, messages):
+            count = sum(isinstance(message, HumanMessage) for message in messages)
+            yield AIMessageChunk(content=f"final-{count}")
+
+    monkeypatch.setattr(
+        supervisor,
+        "create_deepseek_chat",
+        lambda *_args, **_kwargs: FakeSupervisor(),
+    )
+    model_calls = iter([Worker(), Final(), Worker(), Final()])
+    monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(model_calls))
+    graph = build_graph(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "conversation-1"}}
+    common = {
+        "model_id": "deepseek-v4-flash",
+        "system_prompt": "",
+        "user_id": "user",
+        "conversation_id": "conversation-1",
+    }
+
+    async def run():
+        first = await graph.ainvoke(
+            {**common, "messages": [HumanMessage(content="first")]},
+            config=config,
+            context=runtime().context,
+        )
+        second = await graph.ainvoke(
+            {**common, "messages": [HumanMessage(content="second")]},
+            config=config,
+            context=runtime().context,
+        )
+        snapshot = await graph.aget_state(config)
+        return first, second, snapshot
+
+    first, second, snapshot = asyncio.run(run())
+    assert len(first["messages"]) == 2
+    assert len(second["messages"]) == 4
+    assert second["messages"][-1].content == "final-2"
+    assert snapshot.values["completed_agents"] == ["general_agent", "supervisor"]
+    assert snapshot.values["source_citations"] == []

@@ -7,7 +7,7 @@
 - **多模型切换** — `deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-chat` (V3) / `deepseek-reasoner` (R1) 一键切换
 - **流式输出** — 基于 POST SSE 的增量渲染，Markdown 边流边解析（memo 优化）
 - **推理过程可视化** — R1 等推理模型自动展示可折叠的「思考过程」，带 shimmer 动画
-- **单主 Agent 工具调用** — 主 Agent 直接使用天气、计算与 Artifact；需要外部资料时只委派一次独立 `deep_search` Agent
+- **Supervisor 多 Agent** — Supervisor 分解并分派任务；General Agent 自主使用天气、计算与 Artifact，Research Agent 专职快速联网与 Deep Search，最后由 Supervisor 整合答案
 - **行内来源链接** — 重要结论后的 `[[cite:n]]` 自动显示为响应式来源 span link，并在会话重载后保留
 - **Artifact 侧栏系统** — 模型用 `createArtifact` 工具产出独立工件；侧栏边流式边渲染，HTML/SVG 可实时预览，代码可一键复制
 - **代码高亮** — `rehype-highlight` 语法高亮 + 语言标签 + 复制按钮，配色随明暗主题切换

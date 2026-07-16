@@ -1,25 +1,11 @@
-"""
-Edge routing logic for the LangGraph agent.
-"""
+"""Explicit worker routing for the Supervisor graph."""
 
-from typing import Literal
-
-from langchain_core.messages import AIMessage
-
-from app.graph.state import AgentState
+from app.graph.state import AgentState, WorkerRoute
 
 
-def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-    """Determine whether to execute tools or end the turn.
-
-    Called after chat_node: if the last message has tool_calls,
-    route to tool_node; otherwise end.
-    """
-    messages = state.get("messages", [])
-    if not messages:
-        return "__end__"
-
-    last_message = messages[-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "tools"
-    return "__end__"
+def route_supervisor(state: AgentState) -> WorkerRoute:
+    """Return the single worker selected by the Supervisor."""
+    decision = state.get("supervisor_decision")
+    if decision and decision["route"] == "research_agent":
+        return "research_agent"
+    return "general_agent"

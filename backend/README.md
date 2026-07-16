@@ -30,6 +30,7 @@ CHECKPOINT_DB_PATH=./checkpoints.db
 REDIS_URL=redis://localhost:6379/0
 REDIS_ENABLED=1
 AUTO_MIGRATE=1
+CONTEXT_MAX_INPUT_TOKENS=32000
 ```
 
 `chatbot.db` is the business source of truth for users, conversations, and UI
@@ -60,46 +61,142 @@ Set `AUTO_MIGRATE=0` only when migrations are managed separately.
 
 ## Architecture
 
-```
-WebSocket /ws
-  ↓
-main.py (FastAPI)
-  ↓
-graph.ainvoke(state, config)
-  ├── main_agent (one LLM handles every user-facing task)
-  │     └── emit: text_*, reasoning_*, tool_call_* events
-  ├── routing (should_continue)
-  └── tools (weather / calculate / artifact / deep_search)
-        ├── direct tools run without another agent
-        └── deep_search_agent → parallel web_search → cited brief
-```
+The backend has one authenticated chat entry point: `POST /api/chat/stream`.
+`main.py` only owns application resources and router registration; request
+validation, persistence, workflow execution, model streaming, and tool
+execution are separate modules.
 
-Authenticated conversations compile the graph once with `AsyncSqliteSaver`.
-The conversation ID is the LangGraph `thread_id`; stream callbacks and cache
-clients are runtime context and are never serialized into checkpoints.
+The main graph implements a Supervisor pattern with two specialized workers:
 
-`deep_search` is capped at one delegation per user turn. Its numbered sources
-are attached to the final assistant message and streamed in a `sources` event.
-
-## WebSocket Protocol
-
-Connect to `ws://localhost:8000/ws`.
-
-**Send a message:**
-```json
-{
-  "type": "send",
-  "messages": [{"role": "user", "content": "Hello"}],
-  "model": "deepseek-v4-flash"
-}
+```text
+START
+  │
+  ▼
+prepare_turn  reset turn-local coordination state
+  │
+  ▼
+supervisor    analyze, decompose, and assign one worker
+  │
+  ├── general_agent ─── weather / calculate / artifact tools
+  │
+  └── research_agent ── web_search / deep_search only
+              │
+              ▼
+supervisor_finalize  integrate the worker result
+              │
+              ▼
+             END
 ```
 
-**Stop generation:**
-```json
-{"type": "stop"}
+The Supervisor returns an auditable assignment with `route`, `task`, and
+`reason`. Explicit `web` and `deep` modes deterministically select the Research
+Agent; automatic mode uses the Supervisor model with a deterministic fallback
+when its JSON cannot be parsed.
+
+The General Agent is an isolated, bounded tool-using subgraph:
+
+```text
+START → prepare → agent ── no tool calls ───────────────→ END
+                    │
+                    └── tool calls → tools → agent
+                                      (maximum 3 rounds)
 ```
 
-**Server events:** `text_start`, `text_delta`, `text_end`, `reasoning_start`, `reasoning_delta`, `reasoning_end`, `tool_call_start`, `tool_call_delta`, `tool_call_end`, `tool_result`, `sources`, `done`, `error`, `pong`
+It can use weather, calculation, and artifact tools, but it cannot call any
+search tool. Its intermediate prose stays internal; its tool-call and tool-
+result messages are returned to the main graph so the live UI, checkpoint, and
+business database contain the same trace.
+
+The Research Agent exclusively owns `web_search` and `deep_search`. Fast mode
+runs one web query. Deep/automatic research invokes the inspectable DAG below:
+
+Deep search is also an inspectable LangGraph DAG rather than an opaque helper:
+
+```text
+START → plan_queries → search_sources → synthesize_brief → END
+              (1-3)       (parallel, max 8 sources)
+```
+
+It is compiled with `checkpointer=False` because it is a stateless per-turn
+sub-workflow with no interrupts or cross-turn memory.
+
+Both worker subgraphs are compiled with `checkpointer=False`. They are bounded
+per-turn workspaces with no interrupts or cross-turn memory; the parent
+Supervisor graph owns conversation persistence.
+
+### State and runtime boundaries
+
+`AgentInput` contains API-owned values: messages, model, system prompt, user,
+and conversation IDs. `AgentState` adds explicit coordination fields:
+
+```text
+supervisor_decision  {route, task, reason}
+active_agent         supervisor | general_agent | research_agent
+completed_agents     ordered list of completed agents
+worker_result        internal result passed back to the Supervisor
+source_citations     normalized search sources
+error                workflow failure, if any
+```
+
+`AgentOutput` exposes only messages and the error consumed by the API. The
+`messages` field uses LangGraph's `add_messages` reducer; coordination fields
+use replacement semantics and are reset by `prepare_turn` after checkpoint
+restoration.
+
+Authenticated conversations compile the main graph once with
+`AsyncSqliteSaver`. The conversation ID is the LangGraph `thread_id`.
+`prepare_turn` clears turn-local fields after checkpoint restoration. Stream
+callbacks, search mode, and cache clients are `AgentRuntimeContext`; they are
+request-scoped dependencies and are never serialized into checkpoints.
+
+Before each model call, the context window keeps all system instructions and
+the newest complete user turns within `CONTEXT_MAX_INPUT_TOKENS`. Tool-call
+messages and their tool results are retained as one turn, so trimming cannot
+create an invalid tool protocol. This only bounds the transient model input;
+the full conversation remains in the business database and LangGraph
+checkpoint for UI history and recovery.
+
+The Research Agent executes one search assignment per turn. Numbered sources
+are attached by `supervisor_finalize` to the final assistant message and
+streamed in a `sources` event.
+
+### End-to-end data flow
+
+```text
+Browser useChatStream
+  → Next.js /api/chat proxy
+  → FastAPI /api/chat/stream (JWT + rate limit + ownership check)
+  → load business history from chatbot.db
+  → compare history with the conversation checkpoint
+      ├─ synchronized: invoke graph with only the new HumanMessage
+      └─ divergent: delete checkpoint and rebuild from business history
+  → graph.ainvoke(AgentInput, thread_id=conversation_id, runtime context)
+  → prepare_turn clears previous coordination state
+  → Supervisor emits {route, task, reason}
+  → selected Worker runs in its isolated subgraph
+      ├─ General Agent: bounded autonomous tool loop
+      └─ Research Agent: fast search or deep-search DAG
+  → Worker returns result + persistable tool trace to shared state
+  → Supervisor integrates one final user-facing answer
+  → graph nodes emit typed events into an asyncio queue
+  → FastAPI encodes queue events as POST SSE
+  → Next.js pipes bytes without transforming them
+  → useChatStream reduces events into UI message parts
+  → completed AI/Tool messages are committed to chatbot.db
+```
+
+The business database is the source of truth for the UI. `checkpoints.db` is
+the durable LangGraph execution state and can be rebuilt when its last message
+ID does not match the business history. Redis is only a tool-result cache and
+rate-limit backend; it is not conversation memory.
+
+### SSE output contract
+
+Graph nodes emit the typed union declared in `app/graph/events.py`:
+`text_start/delta/end`, `reasoning_start/delta/end`,
+`tool_call_start/delta/end`, `tool_result`, `sources`, and `activity`. The API
+runner adds the terminal `done` or `error` event. Field names intentionally
+match `src/lib/types.ts`.
 
 ## Testing
 

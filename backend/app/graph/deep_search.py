@@ -1,41 +1,50 @@
-"""A bounded, independent agent for web research."""
+"""A bounded, acyclic LangGraph workflow for web research."""
 
 import asyncio
 import json
 import logging
 import re
-from typing import Any, Awaitable, Callable
+from typing import Any, TypedDict
 from urllib.parse import urldefrag
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 
 from app.config import DeepSeekModelId
+from app.graph.context import AgentRuntimeContext
+from app.graph.model import emit, message_text
+from app.graph.state import SourceCitation
 from app.llm.client import create_deepseek_chat
 from app.tools.web_search import web_search
 
 logger = logging.getLogger("chatbot.deep_search")
-
-EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 MAX_QUERIES = 3
 MAX_SOURCES = 8
 
 
-def _message_text(message: BaseMessage) -> str:
-    """Return plain text from a LangChain message."""
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            str(part.get("text", ""))
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
-    return str(content or "")
+class DeepSearchInput(TypedDict):
+    query: str
+    focus: str
+    model_id: DeepSeekModelId
+
+
+class DeepSearchState(DeepSearchInput):
+    queries: list[str]
+    search_outputs: list[dict[str, Any]]
+    results: list[SourceCitation]
+    summary: str
+
+
+class DeepSearchOutput(TypedDict):
+    query: str
+    queries: list[str]
+    summary: str
+    results: list[SourceCitation]
 
 
 def parse_search_queries(raw: str, fallback: str) -> list[str]:
-    """Parse and de-duplicate up to three search queries from model output."""
+    """Parse and de-duplicate up to three planned search queries."""
     candidates: list[Any] = []
     match = re.search(r"\[[\s\S]*?\]", raw)
     if match:
@@ -45,7 +54,6 @@ def parse_search_queries(raw: str, fallback: str) -> list[str]:
                 candidates = parsed
         except json.JSONDecodeError:
             pass
-
     if not candidates:
         candidates = [line.lstrip("-• 0123456789.").strip() for line in raw.splitlines()]
 
@@ -62,9 +70,9 @@ def parse_search_queries(raw: str, fallback: str) -> list[str]:
     return queries
 
 
-def dedupe_sources(search_outputs: list[Any]) -> list[dict[str, Any]]:
-    """Flatten search results and remove duplicate or invalid URLs."""
-    sources: list[dict[str, Any]] = []
+def dedupe_sources(search_outputs: list[Any]) -> list[SourceCitation]:
+    """Flatten search results and remove duplicate or unsafe URLs."""
+    sources: list[SourceCitation] = []
     seen_urls: set[str] = set()
     for output in search_outputs:
         if not isinstance(output, dict):
@@ -88,91 +96,135 @@ def dedupe_sources(search_outputs: list[Any]) -> list[dict[str, Any]]:
     return sources
 
 
-async def _emit(callback: EventCallback | None, event: dict[str, Any]) -> None:
-    if callback:
-        await callback(event)
-
-
-async def deep_search_agent(
-    query: str,
-    focus: str,
-    model_id: DeepSeekModelId,
-    callback: EventCallback | None = None,
-) -> dict[str, Any]:
-    """Plan searches, collect evidence, and synthesize a citation-ready brief."""
+async def plan_queries_node(state: DeepSearchState) -> dict[str, Any]:
+    """Use one model call to plan at most three complementary queries."""
+    query = state["query"]
+    focus = state.get("focus", "")
+    model_id: DeepSeekModelId = state.get("model_id", "deepseek-v4-flash")  # type: ignore[assignment]
     llm = create_deepseek_chat(model_id, temperature=0.2)
-    planning_prompt = (
+    prompt = (
         f"研究问题：{query}\n研究重点：{focus or '无'}\n\n"
         "生成 1 到 3 个互补且精确的网络搜索词。只输出 JSON 字符串数组，"
         "不要解释。优先覆盖时效性、权威来源和问题中的不同关键角度。"
     )
     try:
         plan = await llm.ainvoke([
-            SystemMessage(content="你是深度搜索 Agent，负责用最少查询获得可靠证据。"),
-            HumanMessage(content=planning_prompt),
+            SystemMessage(content="你负责为有界研究工作流规划最少量的可靠检索。"),
+            HumanMessage(content=prompt),
         ])
-        queries = parse_search_queries(_message_text(plan), query)
+        queries = parse_search_queries(message_text(plan), query)
     except Exception:
-        logger.exception("Deep-search planning failed; using the original query")
+        logger.exception("Deep-search planning failed; using original query")
         queries = [query]
+    return {"queries": queries}
 
-    await _emit(callback, {
+
+async def search_sources_node(
+    state: DeepSearchState,
+    runtime: Runtime[AgentRuntimeContext],
+) -> dict[str, Any]:
+    """Run the planned searches concurrently and normalize their sources."""
+    queries = state.get("queries", []) or [state["query"]]
+    callback = runtime.context.stream_callback
+    await emit(callback, {
         "type": "activity",
         "kind": "searching",
         "message": f"深度搜索：并行检索 {len(queries)} 个方向",
     })
-    outputs = await asyncio.gather(
-        *(web_search.ainvoke({"query": item, "max_results": 4}) for item in queries),
+    raw_outputs = await asyncio.gather(
+        *(web_search.ainvoke({"query": query, "max_results": 4}) for query in queries),
         return_exceptions=True,
     )
-    successful = [output for output in outputs if not isinstance(output, BaseException)]
-    sources = dedupe_sources(successful)
-    await _emit(callback, {
+    outputs = [output for output in raw_outputs if isinstance(output, dict)]
+    sources = dedupe_sources(outputs)
+    await emit(callback, {
         "type": "activity",
         "kind": "retrieved",
         "message": f"已整理 {len(sources)} 个不重复来源",
     })
+    return {"search_outputs": outputs, "results": sources}
 
+
+async def synthesize_brief_node(
+    state: DeepSearchState,
+    runtime: Runtime[AgentRuntimeContext],
+) -> dict[str, Any]:
+    """Create a citation-ready brief from only the collected evidence."""
+    sources = state.get("results", [])
     if not sources:
         return {
-            "query": query,
-            "queries": queries,
             "summary": "没有检索到可用来源。请明确说明无法从搜索结果核验信息。",
-            "results": [],
         }
 
+    callback = runtime.context.stream_callback
+    await emit(callback, {
+        "type": "activity",
+        "kind": "analyzing",
+        "message": "深度搜索工作流正在交叉整理证据",
+    })
     evidence = "\n\n".join(
         f"[{index}] {source['title']}\nURL: {source['url']}\n摘要: {source['content']}"
         for index, source in enumerate(sources, start=1)
     )
-    await _emit(callback, {
-        "type": "activity",
-        "kind": "analyzing",
-        "message": "深度搜索 Agent 正在交叉整理证据",
-    })
-    synthesis_prompt = (
-        f"用户问题：{query}\n研究重点：{focus or '无'}\n\n来源：\n{evidence}\n\n"
-        "写一份紧凑的研究简报供主 Agent 使用。只依据来源，指出冲突或不确定性。"
-        "每个事实句都必须在该句句末标点前紧跟 [[cite:1]] 或 [[cite:1,2]]；"
-        "一个标记只支撑它紧邻的句子，同一句有多个来源时合并编号。"
-        "编号只能来自上面的来源，不要输出裸 URL，不要把引用集中到段末，也不要另写参考资料列表。"
+    prompt = (
+        f"用户问题：{state['query']}\n研究重点：{state.get('focus') or '无'}\n\n"
+        f"来源：\n{evidence}\n\n"
+        "写一份紧凑的研究简报供回答工作流使用。只依据来源，指出冲突或不确定性。"
+        "每个事实句都必须在句末标点前紧跟 [[cite:1]] 或 [[cite:1,2]]；"
+        "编号只能来自上面的来源，不要输出裸 URL 或另写参考资料列表。"
     )
+    model_id: DeepSeekModelId = state.get("model_id", "deepseek-v4-flash")  # type: ignore[assignment]
     try:
-        synthesis = await llm.ainvoke([
-            SystemMessage(content="你是独立的深度搜索 Agent；准确性和可追溯性优先。"),
-            HumanMessage(content=synthesis_prompt),
+        synthesis = await create_deepseek_chat(model_id, temperature=0.2).ainvoke([
+            SystemMessage(content="你负责把检索证据整理成准确、可追溯的研究简报。"),
+            HumanMessage(content=prompt),
         ])
-        summary = _message_text(synthesis).strip()
+        summary = message_text(synthesis).strip()
     except Exception:
         logger.exception("Deep-search synthesis failed")
         summary = "\n".join(
             f"- {source['title']}：{source['content']} [[cite:{index}]]"
             for index, source in enumerate(sources, start=1)
         )
+    return {"summary": summary}
 
+
+def build_deep_search_graph():
+    """Compile the stateless plan → search → synthesize research DAG."""
+    graph = StateGraph(
+        DeepSearchState,
+        context_schema=AgentRuntimeContext,
+        input_schema=DeepSearchInput,
+        output_schema=DeepSearchOutput,
+    )
+    graph.add_node("plan_queries", plan_queries_node)
+    graph.add_node("search_sources", search_sources_node)
+    graph.add_node("synthesize_brief", synthesize_brief_node)
+    graph.add_edge(START, "plan_queries")
+    graph.add_edge("plan_queries", "search_sources")
+    graph.add_edge("search_sources", "synthesize_brief")
+    graph.add_edge("synthesize_brief", END)
+    return graph.compile(checkpointer=False, name="deep_search_workflow")
+
+
+DEEP_SEARCH_GRAPH = build_deep_search_graph()
+
+
+async def run_deep_search_workflow(
+    *,
+    query: str,
+    focus: str,
+    model_id: DeepSeekModelId,
+    context: AgentRuntimeContext,
+) -> dict[str, Any]:
+    """Invoke the inspectable research DAG and expose its stable tool output."""
+    result = await DEEP_SEARCH_GRAPH.ainvoke(
+        {"query": query, "focus": focus, "model_id": model_id},
+        context=context,
+    )
     return {
-        "query": query,
-        "queries": queries,
-        "summary": summary,
-        "results": sources,
+        "query": result["query"],
+        "queries": result.get("queries", [query]),
+        "summary": result.get("summary", ""),
+        "results": result.get("results", []),
     }

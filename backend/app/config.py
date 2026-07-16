@@ -19,6 +19,12 @@ CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./checkpoints.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_ENABLED = os.getenv("REDIS_ENABLED", "1").lower() not in {"0", "false", "no"}
 AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "1").lower() not in {"0", "false", "no"}
+# Upper bound for the complete prompt sent to a chat model. Checkpoints retain
+# the full thread; this budget only controls the transient model input window.
+CONTEXT_MAX_INPUT_TOKENS = max(
+    1024,
+    int(os.getenv("CONTEXT_MAX_INPUT_TOKENS", "32000")),
+)
 
 # JWT
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-in-production")

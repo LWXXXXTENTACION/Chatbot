@@ -11,13 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response, StreamingResponse
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import BaseMessage, HumanMessage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -38,7 +32,8 @@ from app.database.messages import (
 from app.database.models import Conversation, Message, User
 from app.graph.builder import build_graph
 from app.graph.context import AgentRuntimeContext, SearchMode
-from app.graph.state import AgentState
+from app.graph.message_conversion import ui_messages_to_langchain
+from app.graph.state import AgentInput
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limit import check_rate_limit
 from app.schemas.chat import ChatRequest
@@ -68,86 +63,6 @@ async def list_models():
     ]
 
 
-# ——— Message conversion (from frontend dicts to LangChain) ———
-
-
-def _extract_text(msg: dict[str, Any]) -> str:
-    """Extract text from a message dict, checking both content and parts fields."""
-    content = msg.get("content", "")
-    parts = msg.get("parts", None)
-
-    if content and str(content).strip():
-        return str(content)
-
-    if parts and isinstance(parts, list):
-        text_bits: list[str] = []
-        for p in parts:
-            if isinstance(p, dict) and p.get("type") == "text":
-                text_bits.append(p.get("text", ""))
-        return "\n".join(text_bits)
-
-    return ""
-
-
-def _convert_messages(raw_messages: list[dict[str, Any]]) -> list[BaseMessage]:
-    """Convert raw message dicts from the frontend into LangChain messages."""
-    result: list[BaseMessage] = []
-    for msg in raw_messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        parts = msg.get("parts", None)
-
-        if role == "system":
-            text = _extract_text(msg)
-            result.append(SystemMessage(content=text if text else str(content)))
-        elif role == "user":
-            text = _extract_text(msg)
-            result.append(HumanMessage(content=text if text else str(content)))
-        elif role == "assistant":
-            if parts and isinstance(parts, list):
-                text_parts: list[str] = []
-                tool_calls: list[dict[str, Any]] = []
-                tool_results: list[ToolMessage] = []
-                for part in parts:
-                    part_type = part.get("type", "")
-                    if part_type == "text":
-                        text_parts.append(part.get("text", ""))
-                    elif part_type == "reasoning":
-                        pass  # skip reasoning parts in conversion
-                    elif part_type and part_type.startswith("tool-"):
-                        tool_name = part_type[5:]
-                        tool_input = part.get("input", {})
-                        tool_call_id = part.get("toolCallId", "")
-                        tool_calls.append({
-                            "id": tool_call_id,
-                            "name": tool_name,
-                            "args": tool_input,
-                            "type": "tool_call",
-                        })
-                        if part.get("state") == "output-available" and part.get("output"):
-                            tool_results.append(ToolMessage(
-                                content=json.dumps(part["output"], ensure_ascii=False),
-                                tool_call_id=tool_call_id,
-                            ))
-                ai_msg = AIMessage(content="\n".join(text_parts) if text_parts else "")
-                if tool_calls:
-                    ai_msg.tool_calls = tool_calls  # type: ignore[assignment]
-                result.append(ai_msg)
-                result.extend(tool_results)
-            else:
-                text = str(content) if isinstance(content, str) else ""
-                if isinstance(content, list):
-                    text_bits = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-                    text = "\n".join(text_bits)
-                result.append(AIMessage(content=text))
-        elif role == "tool":
-            result.append(ToolMessage(
-                content=json.dumps(content) if isinstance(content, dict) else str(content),
-                tool_call_id=msg.get("toolCallId", ""),
-            ))
-    return result
-
-
 # ——— Graph runner ———
 
 
@@ -164,17 +79,12 @@ async def _run_graph_and_stream(
     search_mode: SearchMode,
 ) -> list[BaseMessage]:
     """Run one graph turn and return messages created after the new user input."""
-    initial_state: AgentState = {
+    initial_state: AgentInput = {
         "messages": input_messages,
         "model_id": model_id,
         "system_prompt": system_prompt,
         "user_id": user_id,
         "conversation_id": conversation_id,
-        "source_citations": [],
-        "retrieved_docs": "",
-        "search_iteration": 0,
-        "search_history": [],
-        "error": None,
     }
     config: dict[str, Any] = {"recursion_limit": 12}
     if conversation_id:
@@ -288,7 +198,7 @@ async def chat_stream(
 
     elif body.messages:
         # Legacy mode: full history from client
-        input_messages = _convert_messages(body.messages)
+        input_messages = ui_messages_to_langchain(body.messages)
     else:
         return Response(
             content=json.dumps({"error": "缺少对话内容"}),

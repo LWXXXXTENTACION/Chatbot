@@ -30,12 +30,14 @@ from app.database.messages import (
     persist_user_message,
 )
 from app.database.models import Conversation, Message, User
+from app.database.observability import persist_run_trace
 from app.graph.builder import build_graph
 from app.graph.context import AgentRuntimeContext, SearchMode
 from app.graph.message_conversion import ui_messages_to_langchain
 from app.graph.state import AgentInput
 from app.middleware.auth import get_current_user
 from app.middleware.rate_limit import check_rate_limit
+from app.observability import TraceCollector, bind_trace
 from app.schemas.chat import ChatRequest
 from app.streaming import stream_sse_events
 
@@ -89,15 +91,23 @@ async def _run_graph_and_stream(
     config: dict[str, Any] = {"recursion_limit": 12}
     if conversation_id:
         config["configurable"] = {"thread_id": conversation_id}
-    final_state = await graph.ainvoke(
+    final_state: dict[str, Any] | None = None
+    async for part in graph.astream(
         initial_state,
         config=config,
         context=AgentRuntimeContext(
-            stream_callback=send_event,
             tool_cache=tool_cache,
             search_mode=search_mode,
         ),
-    )
+        stream_mode=["values", "custom"],
+        version="v2",
+    ):
+        if part["type"] == "custom":
+            await send_event(part["data"])
+        elif part["type"] == "values":
+            final_state = part["data"]
+    if final_state is None:
+        raise RuntimeError("LangGraph completed without a final state")
     if final_state.get("error"):
         raise RuntimeError(str(final_state["error"]))
 
@@ -206,10 +216,18 @@ async def chat_stream(
             media_type="application/json",
         )
 
+    collector = TraceCollector(
+        conversation_id=conversation_id,
+        user_message_id=str(new_user_msg.id) if new_user_msg else "",
+        model=model_id,
+        search_mode=body.search_mode,
+    )
+
     # SSE streaming setup
     event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
     async def send_event(event: dict[str, Any]) -> None:
+        collector.observe_event(event)
         await event_queue.put(event)
 
     checkpointer = getattr(request.app.state, "checkpointer", None)
@@ -222,20 +240,31 @@ async def chat_stream(
             except Exception:
                 logger.exception("Failed to invalidate checkpoint for %s", conversation_id)
 
+    async def persist_trace_safely(trace: dict[str, Any]) -> None:
+        """Observability must never turn a completed answer into a failed run."""
+        if not conversation_id or new_user_msg is None:
+            return
+        try:
+            async with async_session() as trace_db:
+                await persist_run_trace(trace_db, str(new_user_msg.id), trace)
+        except Exception:
+            logger.exception("Failed to persist trace %s", trace.get("run_id"))
+
     async def run_and_persist() -> None:
         try:
-            new_messages = await _run_graph_and_stream(
-                graph,
-                input_messages,
-                str(new_user_msg.id) if new_user_msg else None,
-                model_id,
-                system,
-                send_event,
-                str(current_user.id),
-                conversation_id,
-                tool_cache,
-                body.search_mode,
-            )
+            with bind_trace(collector):
+                new_messages = await _run_graph_and_stream(
+                    graph,
+                    input_messages,
+                    str(new_user_msg.id) if new_user_msg else None,
+                    model_id,
+                    system,
+                    send_event,
+                    str(current_user.id),
+                    conversation_id,
+                    tool_cache,
+                    body.search_mode,
+                )
             if conversation_id and new_messages:
                 async with async_session() as persistence_db:
                     await persist_graph_messages(
@@ -243,6 +272,9 @@ async def chat_stream(
                         conversation_id,
                         new_messages,
                     )
+            trace = collector.finish("success")
+            await persist_trace_safely(trace)
+            await send_event({"type": "trace_summary", "trace": trace})
             done_id = next(
                 (str(message.id) for message in reversed(new_messages) if message.id),
                 "",
@@ -250,10 +282,14 @@ async def chat_stream(
             await send_event({"type": "done", "messageId": done_id})
         except asyncio.CancelledError:
             logger.info("Graph run cancelled for conversation %s", conversation_id)
+            trace = collector.finish("cancelled", error_code="CLIENT_CANCELLED")
+            await asyncio.shield(persist_trace_safely(trace))
             await invalidate_checkpoint()
             raise
         except Exception as exc:
             logger.exception("Graph or persistence failure")
+            trace = collector.finish("error", error_code=type(exc).__name__)
+            await persist_trace_safely(trace)
             await invalidate_checkpoint()
             await send_event({
                 "type": "error",

@@ -49,6 +49,102 @@ export interface MessagePartData {
   position: number;
 }
 
+export interface TraceMetrics {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  llm_calls: number;
+  tool_calls: number;
+  tool_errors: number;
+  cache_hits: number;
+  sources: number;
+}
+
+export interface TraceTimelineEvent {
+  id: string;
+  type: string;
+  label: string;
+  status: "running" | "completed" | "error";
+  at_ms: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface RunEvaluation {
+  passed: boolean;
+  note: string;
+  case_id: string;
+  updated_at: string;
+}
+
+export interface RunTrace {
+  schema_version: number;
+  run_id: string;
+  version: {
+    id: string;
+    label: string;
+    code_fingerprint: string;
+  };
+  conversation_id: string;
+  user_message_id: string;
+  conversation?: { id: string; title: string };
+  model: string;
+  search_mode: "auto" | "web" | "deep";
+  status: "success" | "error" | "cancelled";
+  error_code: string | null;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  metrics: TraceMetrics;
+  context: {
+    strategies?: string[];
+    estimated_tokens_before?: number;
+    estimated_tokens_after?: number;
+    max_tokens?: number;
+    removed_messages?: number;
+    compacted_tool_results?: number;
+    overflowed?: boolean;
+  };
+  timeline: TraceTimelineEvent[];
+  evaluation: RunEvaluation | null;
+}
+
+export interface VersionCategoryMetrics {
+  id: string;
+  label: string;
+  runs: number;
+  total_tokens: number;
+  avg_tokens: number;
+}
+
+export interface ObservabilityVersion {
+  id: string;
+  label: string;
+  model: string;
+  code_fingerprint: string;
+  first_seen: string;
+  last_seen: string;
+  runs: number;
+  successful_runs: number;
+  failed_runs: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_tokens: number;
+  llm_calls: number;
+  tool_calls: number;
+  avg_duration_ms: number;
+  evaluated_runs: number;
+  passed_runs: number;
+  success_rate: number;
+  pass_rate: number | null;
+  categories: VersionCategoryMetrics[];
+}
+
+export interface ObservabilityOverview {
+  versions: ObservabilityVersion[];
+  runs: RunTrace[];
+}
+
 // ——— Auth ———
 
 export const api = {
@@ -144,5 +240,30 @@ export const api = {
       method: "DELETE",
     });
     if (!res.ok) throw new Error("删除对话失败");
+  },
+
+  // ——— Observability ———
+
+  async getObservabilityOverview(limit = 200): Promise<ObservabilityOverview> {
+    const res = await fetchWithAuth(
+      `${BACKEND}/api/observability/overview?limit=${limit}`,
+    );
+    if (!res.ok) throw new Error("获取运行观测数据失败");
+    return res.json();
+  },
+
+  async evaluateRun(
+    runId: string,
+    body: { passed: boolean | null; note?: string; case_id?: string },
+  ): Promise<RunTrace> {
+    const res = await fetchWithAuth(
+      `${BACKEND}/api/observability/runs/${runId}/evaluation`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) throw new Error("保存评测结果失败");
+    return res.json();
   },
 };

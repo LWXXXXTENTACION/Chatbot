@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.runtime import Runtime
+from langgraph.types import StreamWriter
 
 from app.config import DeepSeekModelId, tools_enabled
 from app.graph.context import AgentRuntimeContext
@@ -92,7 +93,7 @@ def _as_model_state(state: GeneralAgentState) -> AgentState:
 
 async def general_agent_node(
     state: GeneralAgentState,
-    runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Think, call tools when needed, or finish the delegated task."""
     model_id = state.get("model_id", "deepseek-v4-flash")
@@ -103,7 +104,7 @@ async def general_agent_node(
     try:
         message = await stream_model_message(
             _as_model_state(state),
-            callback=runtime.context.stream_callback,
+            writer=writer,
             system_prompts=prompts,
             tools=available_tools,
             attach_sources=False,
@@ -139,6 +140,7 @@ def route_general_agent(
 async def general_tools_node(
     state: GeneralAgentState,
     runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Execute one General Agent tool batch and return control to that Agent."""
     last = state.get("worker_messages", [])[-1]
@@ -149,6 +151,7 @@ async def general_tools_node(
             last.tool_calls,
             model_id=state.get("model_id", "deepseek-v4-flash"),
             context=runtime.context,
+            writer=writer,
         )
         return {
             "worker_messages": messages,
@@ -205,12 +208,14 @@ async def run_general_agent(
     model_id: DeepSeekModelId,
     system_prompt: str,
     context: AgentRuntimeContext,
+    writer: StreamWriter,
     context_summary: str = "",
     session_memory: str = "",
 ) -> tuple[str, list[BaseMessage]]:
     """Run the worker and return its result plus persistable tool trace."""
     baseline = len(conversation_messages) + 1  # plus delegated HumanMessage
-    result = await GENERAL_AGENT_GRAPH.ainvoke(
+    result: dict[str, Any] | None = None
+    async for part in GENERAL_AGENT_GRAPH.astream(
         {
             "task": task,
             "conversation_messages": conversation_messages,
@@ -220,7 +225,15 @@ async def run_general_agent(
             "session_memory": session_memory,
         },
         context=context,
-    )
+        stream_mode=["values", "custom"],
+        version="v2",
+    ):
+        if part["type"] == "custom":
+            writer(part["data"])
+        elif part["type"] == "values":
+            result = part["data"]
+    if result is None:
+        raise RuntimeError("General Agent graph completed without a final state")
     if result.get("error"):
         raise RuntimeError(str(result["error"]))
     generated = result.get("worker_messages", [])[baseline:]
@@ -243,13 +256,14 @@ async def run_general_agent(
 async def general_worker_node(
     state: AgentState,
     runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Main-graph adapter for the isolated General Agent subgraph."""
     decision = state.get("supervisor_decision")
     if not decision:
         return {"error": "Supervisor 未提供 General Agent 任务"}
     try:
-        await emit(runtime.context.stream_callback, {
+        await emit(writer, {
             "type": "activity",
             "kind": "analyzing",
             "message": "General Agent 正在执行普通任务",
@@ -262,6 +276,7 @@ async def general_worker_node(
             context_summary=state.get("context_summary", ""),
             session_memory=state.get("session_memory", ""),
             context=runtime.context,
+            writer=writer,
         )
         completed = list(state.get("completed_agents", []))
         completed.append("general_agent")

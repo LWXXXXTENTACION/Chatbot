@@ -22,7 +22,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langgraph.runtime import Runtime
+from langgraph.types import StreamWriter
 
 from app.config import (
     CONTEXT_COLLAPSE_RATIO,
@@ -34,7 +34,6 @@ from app.config import (
     CONTEXT_SESSION_MEMORY_RATIO,
     DeepSeekModelId,
 )
-from app.graph.context import AgentRuntimeContext
 from app.graph.context_window import estimate_tokens, split_complete_turns
 from app.graph.model import emit, message_text
 from app.graph.state import AgentState, ContextReport, ContextStrategy
@@ -273,8 +272,8 @@ def _remove_messages(
 
 async def manage_context(
     state: AgentState,
-    runtime: Runtime[AgentRuntimeContext],
     *,
+    writer: StreamWriter,
     policy: ContextPolicy | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -377,7 +376,7 @@ async def manage_context(
         "removed_messages": len(removed_ids),
         "overflowed": tokens_after > effective_policy.max_tokens,
     }
-    await emit(runtime.context.stream_callback, {
+    await emit(writer, {
         "type": "context_status",
         "strategies": strategies,
         "estimatedTokensBefore": tokens_before,
@@ -409,7 +408,7 @@ async def manage_context(
 
 async def context_manager_node(
     state: AgentState,
-    runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """LangGraph adapter using environment-configured context policy."""
-    return await manage_context(state, runtime)
+    return await manage_context(state, writer=writer)

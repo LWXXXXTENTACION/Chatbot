@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.runtime import Runtime
+from langgraph.types import StreamWriter
 
 from app.graph.context import AgentRuntimeContext
 from app.graph.model import FORCED_SEARCH_CALL_PREFIX, emit
@@ -60,6 +61,7 @@ def _worker_result(tool_message: ToolMessage) -> str:
 async def research_worker_node(
     state: AgentState,
     runtime: Runtime[AgentRuntimeContext],
+    writer: StreamWriter,
 ) -> dict[str, Any]:
     """Execute the Supervisor assignment through the dedicated search path."""
     if not state.get("supervisor_decision"):
@@ -69,23 +71,23 @@ async def research_worker_node(
     call = ai_message.tool_calls[0]
     args_json = json.dumps(call["args"], ensure_ascii=False, separators=(",", ":"))
     try:
-        await emit(context.stream_callback, {
+        await emit(writer, {
             "type": "activity",
             "kind": "searching",
             "message": "Research Agent 正在执行专用搜索任务",
         })
-        await emit(context.stream_callback, {
+        await emit(writer, {
             "type": "tool_call_start",
             "messageId": str(ai_message.id),
             "toolCallId": call_id,
             "toolName": call["name"],
         })
-        await emit(context.stream_callback, {
+        await emit(writer, {
             "type": "tool_call_delta",
             "toolCallId": call_id,
             "delta": args_json,
         })
-        await emit(context.stream_callback, {
+        await emit(writer, {
             "type": "tool_call_end",
             "toolCallId": call_id,
         })
@@ -93,7 +95,7 @@ async def research_worker_node(
             **state,
             "messages": [ai_message],
         })
-        result = await execute_tool_batch(tool_state, context)
+        result = await execute_tool_batch(tool_state, context, writer)
         tool_messages = result.get("messages", [])
         if not tool_messages or not isinstance(tool_messages[0], ToolMessage):
             return {"error": "Research Agent 未得到有效工具结果"}

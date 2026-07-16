@@ -189,7 +189,11 @@ def db_message_to_langchain(message: Message) -> list[BaseMessage]:
     if source_part and isinstance(source_part.tool_output, dict):
         additional_kwargs["sources"] = source_part.tool_output.get("results", [])
 
-    tool_parts = [part for part in parts if part.type.startswith("tool-")]
+    tool_parts = [
+        part
+        for part in parts
+        if part.type.startswith("tool-") and part.type != "tool-trace"
+    ]
     tool_calls = [
         {
             "id": part.tool_call_id or "",

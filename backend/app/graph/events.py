@@ -7,7 +7,7 @@ unstructured ``dict[str, Any]`` values through every layer.
 
 from typing import Any, Literal, NotRequired, TypedDict
 
-from app.graph.state import SourceCitation
+from app.graph.state import ContextStrategy, SourceCitation
 
 
 class TextStartEvent(TypedDict):
@@ -76,8 +76,28 @@ class SourcesEvent(TypedDict):
 
 class ActivityEvent(TypedDict):
     type: Literal["activity"]
-    kind: Literal["searching", "retrieved", "analyzing", "answering", "rewriting"]
+    kind: Literal[
+        "searching",
+        "retrieved",
+        "analyzing",
+        "answering",
+        "rewriting",
+        "compacting",
+    ]
     message: str
+
+
+class ContextStatusEvent(TypedDict):
+    type: Literal["context_status"]
+    strategies: list[ContextStrategy]
+    estimatedTokensBefore: int
+    estimatedTokensAfter: int
+    maxTokens: int
+    pressureBefore: float
+    pressureAfter: float
+    compactedToolResults: int
+    removedMessages: int
+    overflowed: bool
 
 
 class DoneEvent(TypedDict):
@@ -104,6 +124,7 @@ StreamEvent = (
     | ToolResultEvent
     | SourcesEvent
     | ActivityEvent
+    | ContextStatusEvent
     | DoneEvent
     | ErrorEvent
 )

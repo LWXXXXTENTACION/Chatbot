@@ -217,6 +217,11 @@ def db_message_to_langchain(message: Message) -> list[BaseMessage]:
             tool_call_id=part.tool_call_id or "",
             name=part.type[5:],
             status="error" if part.tool_state == "output-error" else "success",
+            additional_kwargs={
+                "context_created_at": message.created_at.replace(
+                    tzinfo=message.created_at.tzinfo or timezone.utc
+                ).astimezone(timezone.utc).isoformat(),
+            },
             id=uuid.uuid5(uuid.NAMESPACE_URL, f"{message.id}:{part.id}").hex,
         ))
     return result

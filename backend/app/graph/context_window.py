@@ -17,11 +17,14 @@ class ContextWindow:
     overflowed: bool
 
 
-def _count_tokens(messages: list[BaseMessage]) -> int:
+def estimate_tokens(messages: list[BaseMessage]) -> int:
+    """Estimate tokens with LangChain's provider-agnostic counter."""
     return count_tokens_approximately(messages)
 
 
-def _complete_turns(messages: list[BaseMessage]) -> tuple[list[BaseMessage], list[list[BaseMessage]]]:
+def split_complete_turns(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], list[list[BaseMessage]]]:
     """Split history into complete user turns while retaining any legacy prefix.
 
     A turn starts with a HumanMessage and contains every following assistant and
@@ -64,7 +67,7 @@ def build_context_window(
         raise ValueError("max_tokens must be greater than zero")
 
     full_input = [*system_messages, *history_messages]
-    original_tokens = _count_tokens(full_input)
+    original_tokens = estimate_tokens(full_input)
     if original_tokens <= max_tokens:
         return ContextWindow(
             messages=full_input,
@@ -74,12 +77,12 @@ def build_context_window(
             overflowed=False,
         )
 
-    prefix, turns = _complete_turns(history_messages)
+    prefix, turns = split_complete_turns(history_messages)
     selected_reversed: list[list[BaseMessage]] = []
-    selected_tokens = _count_tokens(system_messages)
+    selected_tokens = estimate_tokens(system_messages)
 
     for turn in reversed(turns):
-        turn_tokens = _count_tokens(turn)
+        turn_tokens = estimate_tokens(turn)
         if not selected_reversed:
             selected_reversed.append(turn)
             selected_tokens += turn_tokens
@@ -94,12 +97,12 @@ def build_context_window(
 
     # Prefix messages only occur in legacy/malformed histories. Preserve them
     # when they fit, but never evict a valid recent user turn for them.
-    prefix_tokens = _count_tokens(prefix)
+    prefix_tokens = estimate_tokens(prefix)
     if prefix and selected_tokens + prefix_tokens <= max_tokens:
         selected_history = [*prefix, *selected_history]
 
     bounded_messages = [*system_messages, *selected_history]
-    estimated_tokens = _count_tokens(bounded_messages)
+    estimated_tokens = estimate_tokens(bounded_messages)
     return ContextWindow(
         messages=bounded_messages,
         estimated_tokens=estimated_tokens,

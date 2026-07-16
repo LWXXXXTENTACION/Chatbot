@@ -13,5 +13,6 @@ def prepare_turn_node(_state: AgentState) -> dict[str, Any]:
         "completed_agents": [],
         "worker_result": "",
         "source_citations": [],
+        "context_report": None,
         "error": None,
     }

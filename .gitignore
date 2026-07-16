@@ -53,3 +53,21 @@ next-env.d.ts
 # reference docs (large, not needed for development)
 interview-qa-langgraph.md
 tutorial/
+
+# Local agent instructions and installed skills
+/.agents/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+/HARNESS.md
+/LOOP.md
+/LOOP_STATE.md
+/loop-constraints.md
+/skills-lock.json
+
+# Personal documents
+/参考简历.jpg
+/resume.*
+/Resume.*
+/cv.*
+/CV.*

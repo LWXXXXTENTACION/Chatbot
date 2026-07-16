@@ -19,6 +19,13 @@ class SourceCitation(TypedDict):
 
 AgentName = Literal["supervisor", "general_agent", "research_agent"]
 WorkerRoute = Literal["general_agent", "research_agent"]
+ContextStrategy = Literal[
+    "microcompact",
+    "context_collapse",
+    "session_memory",
+    "full_compact",
+    "ptl_truncation",
+]
 
 
 class SupervisorDecision(TypedDict):
@@ -27,6 +34,20 @@ class SupervisorDecision(TypedDict):
     route: WorkerRoute
     task: str
     reason: str
+
+
+class ContextReport(TypedDict):
+    """Observable result of one context-pressure evaluation."""
+
+    strategies: list[ContextStrategy]
+    estimated_tokens_before: int
+    estimated_tokens_after: int
+    max_tokens: int
+    pressure_before: float
+    pressure_after: float
+    compacted_tool_results: int
+    removed_messages: int
+    overflowed: bool
 
 
 class AgentInput(TypedDict):
@@ -57,6 +78,10 @@ class AgentState(AgentInput):
     completed_agents: list[AgentName]
     worker_result: str
     source_citations: list[SourceCitation]
+    context_summary: str
+    session_memory: str
+    session_memory_cursor: str
+    context_report: ContextReport | None
     error: str | None
 
 

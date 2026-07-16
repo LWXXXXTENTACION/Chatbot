@@ -6,6 +6,7 @@ from langchain_core.messages import (
 )
 
 from app.graph.context_window import build_context_window
+from app.graph.model import build_model_messages
 
 
 def test_context_window_keeps_all_messages_when_under_budget():
@@ -75,3 +76,35 @@ def test_context_window_rejects_non_positive_budget():
         assert str(exc) == "max_tokens must be greater than zero"
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_model_input_includes_compacted_summary_and_session_memory():
+    messages = build_model_messages(
+        {
+            "messages": [HumanMessage(content="current")],
+            "model_id": "deepseek-v4-flash",
+            "system_prompt": "",
+            "user_id": "user",
+            "conversation_id": "conversation",
+            "supervisor_decision": None,
+            "active_agent": None,
+            "completed_agents": [],
+            "worker_result": "",
+            "source_citations": [],
+            "context_summary": "Earlier decision: use SQLite",
+            "session_memory": "User prefers concise Chinese answers",
+            "session_memory_cursor": "old-message",
+            "context_report": None,
+            "error": None,
+        },
+        ["node prompt"],
+    )
+
+    system_text = "\n".join(
+        str(message.content)
+        for message in messages
+        if isinstance(message, SystemMessage)
+    )
+    assert "Earlier decision: use SQLite" in system_text
+    assert "User prefers concise Chinese answers" in system_text
+    assert messages[-1].content == "current"

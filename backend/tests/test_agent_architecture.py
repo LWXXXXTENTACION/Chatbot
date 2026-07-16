@@ -27,6 +27,10 @@ def base_state(**overrides):
         "completed_agents": [],
         "worker_result": "",
         "source_citations": [],
+        "context_summary": "",
+        "session_memory": "",
+        "session_memory_cursor": "",
+        "context_report": None,
         "error": None,
     }
     state.update(overrides)
@@ -68,6 +72,7 @@ def test_main_graph_is_a_supervisor_workflow():
     assert set(graph.nodes) == {
         "__start__",
         "prepare_turn",
+        "context_manager",
         "supervisor",
         "general_agent",
         "research_agent",
@@ -75,6 +80,8 @@ def test_main_graph_is_a_supervisor_workflow():
         "__end__",
     }
     edges = {(edge.source, edge.target) for edge in graph.edges}
+    assert ("prepare_turn", "context_manager") in edges
+    assert ("context_manager", "supervisor") in edges
     assert ("supervisor", "general_agent") in edges
     assert ("supervisor", "research_agent") in edges
     assert ("general_agent", "supervisor_finalize") in edges
@@ -135,6 +142,7 @@ def test_prepare_turn_resets_all_coordination_state():
         "completed_agents": [],
         "worker_result": "",
         "source_citations": [],
+        "context_report": None,
         "error": None,
     }
 

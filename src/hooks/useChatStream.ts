@@ -6,11 +6,13 @@ import type {
   Activity,
   ArtifactKind,
   ChatUIMessage,
+  ContextStrategy,
   MessagePart,
   TextPart,
   ReasoningPart,
   ToolPartBase,
   SSEActivity,
+  SSEContextStatus,
   SSEServerMessage,
   SearchMode,
 } from "@/lib/types";
@@ -380,6 +382,28 @@ export function useChatStream({
           timestamp: Date.now(),
         };
         setActivities((prev) => [...prev, newActivity]);
+        break;
+      }
+
+      case "context_status": {
+        const contextData = data as SSEContextStatus;
+        if (contextData.strategies.length > 0 || contextData.overflowed) {
+          const strategyLabels: Record<ContextStrategy, string> = {
+            microcompact: "工具结果瘦身",
+            context_collapse: "分段摘要",
+            session_memory: "会话记忆",
+            full_compact: "全量压缩",
+            ptl_truncation: "最早轮次截断",
+          };
+          const labels = contextData.strategies
+            .map((strategy) => strategyLabels[strategy] ?? strategy)
+            .join(" → ");
+          setActivities((prev) => [...prev, {
+            kind: "compacting",
+            message: `${labels || "上下文仍超限"}：约 ${contextData.estimatedTokensBefore} → ${contextData.estimatedTokensAfter} tokens`,
+            timestamp: Date.now(),
+          }]);
+        }
         break;
       }
 

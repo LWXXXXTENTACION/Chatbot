@@ -1,6 +1,6 @@
 "use client";
 
-import { Brain, Search, FileText, PenLine, RefreshCw } from "lucide-react";
+import { Brain, Search, FileText, PenLine, RefreshCw, Minimize2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Activity } from "@/lib/types";
 
@@ -10,6 +10,7 @@ const ACTIVITY_ICONS: Record<Activity["kind"], LucideIcon> = {
   analyzing: Brain,
   answering: PenLine,
   rewriting: RefreshCw,
+  compacting: Minimize2,
 };
 
 export function ActivityTimeline({ activities }: { activities: Activity[] }) {
@@ -18,7 +19,7 @@ export function ActivityTimeline({ activities }: { activities: Activity[] }) {
   return (
     <div className="my-2 rounded-2xl border border-[var(--border)] bg-[var(--bg-elev)]/60 p-3 backdrop-blur">
       <p className="mb-2 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-[var(--fg-subtle)]">
-        🔬 研究进度
+        Agent 工作流
       </p>
       <div className="space-y-1.5">
         {activities.map((a, i) => {

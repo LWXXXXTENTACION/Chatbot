@@ -6,6 +6,7 @@ from app.agents.general import general_worker_node
 from app.agents.research import research_worker_node
 from app.agents.supervisor import supervisor_finalize_node, supervisor_node
 from app.graph.context import AgentRuntimeContext
+from app.graph.context_manager import context_manager_node
 from app.graph.nodes import prepare_turn_node
 from app.graph.routing import route_supervisor
 from app.graph.state import AgentInput, AgentOutput, AgentState
@@ -14,7 +15,8 @@ from app.graph.state import AgentInput, AgentOutput, AgentState
 def build_graph(*, checkpointer=None):
     """Compile one Supervisor assignment and integration cycle.
 
-    START → prepare_turn → supervisor → one worker → supervisor_finalize → END
+    START → prepare_turn → context_manager → supervisor → one worker →
+    supervisor_finalize → END
     """
     graph = StateGraph(
         AgentState,
@@ -23,13 +25,15 @@ def build_graph(*, checkpointer=None):
         output_schema=AgentOutput,
     )
     graph.add_node("prepare_turn", prepare_turn_node)
+    graph.add_node("context_manager", context_manager_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("general_agent", general_worker_node)
     graph.add_node("research_agent", research_worker_node)
     graph.add_node("supervisor_finalize", supervisor_finalize_node)
 
     graph.add_edge(START, "prepare_turn")
-    graph.add_edge("prepare_turn", "supervisor")
+    graph.add_edge("prepare_turn", "context_manager")
+    graph.add_edge("context_manager", "supervisor")
     graph.add_conditional_edges(
         "supervisor",
         route_supervisor,

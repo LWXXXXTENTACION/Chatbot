@@ -31,6 +31,12 @@ REDIS_URL=redis://localhost:6379/0
 REDIS_ENABLED=1
 AUTO_MIGRATE=1
 CONTEXT_MAX_INPUT_TOKENS=32000
+CONTEXT_MICROCOMPACT_TTL_SECONDS=1800
+CONTEXT_SESSION_MEMORY_RATIO=0.45
+CONTEXT_COLLAPSE_RATIO=0.62
+CONTEXT_FULL_COMPACT_RATIO=0.82
+CONTEXT_PTL_TRUNCATION_RATIO=0.95
+CONTEXT_KEEP_RECENT_TURNS=2
 ```
 
 `chatbot.db` is the business source of truth for users, conversations, and UI
@@ -73,6 +79,9 @@ START
   │
   ▼
 prepare_turn  reset turn-local coordination state
+  │
+  ▼
+context_manager  evaluate pressure and compact durable working context
   │
   ▼
 supervisor    analyze, decompose, and assign one worker
@@ -135,6 +144,10 @@ active_agent         supervisor | general_agent | research_agent
 completed_agents     ordered list of completed agents
 worker_result        internal result passed back to the Supervisor
 source_citations     normalized search sources
+context_summary      rolling summary of collapsed early turns
+session_memory       thread-scoped memory document with durable facts
+session_memory_cursor last message extracted into session memory
+context_report       applied strategies, token estimates, and overflow flag
 error                workflow failure, if any
 ```
 
@@ -149,12 +162,29 @@ Authenticated conversations compile the main graph once with
 callbacks, search mode, and cache clients are `AgentRuntimeContext`; they are
 request-scoped dependencies and are never serialized into checkpoints.
 
-Before each model call, the context window keeps all system instructions and
-the newest complete user turns within `CONTEXT_MAX_INPUT_TOKENS`. Tool-call
-messages and their tool results are retained as one turn, so trimming cannot
-create an invalid tool protocol. This only bounds the transient model input;
-the full conversation remains in the business database and LangGraph
-checkpoint for UI history and recovery.
+Before the Supervisor runs, `context_manager` applies five ordered pressure
+strategies. Ratios are measured against `CONTEXT_MAX_INPUT_TOKENS`:
+
+| Strategy | Default trigger | State change |
+|---|---:|---|
+| `microcompact` | tool result older than 30m | replace the result payload with a small marker while preserving the `ToolMessage` ID and call metadata |
+| `session_memory` | 45% | extract durable preferences, project facts, constraints, conventions, and open work into the thread-scoped memory document |
+| `context_collapse` | 62% | summarize the oldest eligible segment and remove that complete segment from checkpoint messages |
+| `full_compact` | 82% | roll all eligible old history into the summary while retaining the configured recent turns verbatim |
+| `ptl_truncation` | 95% after compression | deterministically remove the earliest complete turn until below the guard or only the latest turn remains |
+
+`context collapse`, `session memory`, and `full compact` share a dedicated
+summarizer call. If that call fails or returns malformed JSON, a bounded local
+fallback preserves role-labelled excerpts instead of failing the chat turn.
+The summary and memory document are injected into later model calls as
+historical system context, including the isolated General Agent.
+
+The final `build_context_window` step remains as a non-mutating model-input
+safety net. Both persistent removal and transient truncation operate on whole
+user turns, so an AI tool call is never separated from its `ToolMessage`.
+The complete visible conversation remains in `chatbot.db`; only the Agent's
+working history in `checkpoints.db` is compacted. If a checkpoint must be
+rebuilt, the business history is loaded and compacted again.
 
 The Research Agent executes one search assignment per turn. Numbered sources
 are attached by `supervisor_finalize` to the final assistant message and
@@ -172,6 +202,10 @@ Browser useChatStream
       └─ divergent: delete checkpoint and rebuild from business history
   → graph.ainvoke(AgentInput, thread_id=conversation_id, runtime context)
   → prepare_turn clears previous coordination state
+  → context_manager estimates tokens and applies zero or more compression strategies
+      ├─ updates checkpoint messages with same-ID replacements / RemoveMessage
+      ├─ persists rolling context_summary + session_memory in AgentState
+      └─ emits context_status with before/after metrics
   → Supervisor emits {route, task, reason}
   → selected Worker runs in its isolated subgraph
       ├─ General Agent: bounded autonomous tool loop
@@ -194,9 +228,12 @@ rate-limit backend; it is not conversation memory.
 
 Graph nodes emit the typed union declared in `app/graph/events.py`:
 `text_start/delta/end`, `reasoning_start/delta/end`,
-`tool_call_start/delta/end`, `tool_result`, `sources`, and `activity`. The API
-runner adds the terminal `done` or `error` event. Field names intentionally
-match `src/lib/types.ts`.
+`tool_call_start/delta/end`, `tool_result`, `sources`, `activity`, and
+`context_status`. The API runner adds the terminal `done` or `error` event.
+`context_status` contains the exact strategies, before/after token estimates,
+pressure ratios, removed-message count, compacted-tool count, and overflow
+flag. Field names intentionally match `src/lib/types.ts`; the client maps an
+applied strategy chain into the visible Agent workflow timeline.
 
 ## Testing
 

@@ -91,7 +91,7 @@ export interface SourcesPart {
 // ============================================================
 
 export interface Activity {
-  kind: "searching" | "retrieved" | "analyzing" | "answering" | "rewriting";
+  kind: "searching" | "retrieved" | "analyzing" | "answering" | "rewriting" | "compacting";
   message: string;
   timestamp: number;
 }
@@ -206,8 +206,28 @@ export interface SSEPong {
 
 export interface SSEActivity {
   type: "activity";
-  kind: "searching" | "retrieved" | "analyzing" | "answering" | "rewriting";
+  kind: "searching" | "retrieved" | "analyzing" | "answering" | "rewriting" | "compacting";
   message: string;
+}
+
+export type ContextStrategy =
+  | "microcompact"
+  | "context_collapse"
+  | "session_memory"
+  | "full_compact"
+  | "ptl_truncation";
+
+export interface SSEContextStatus {
+  type: "context_status";
+  strategies: ContextStrategy[];
+  estimatedTokensBefore: number;
+  estimatedTokensAfter: number;
+  maxTokens: number;
+  pressureBefore: number;
+  pressureAfter: number;
+  compactedToolResults: number;
+  removedMessages: number;
+  overflowed: boolean;
 }
 
 /** Union of all SSE event types received from the backend. */
@@ -226,4 +246,5 @@ export type SSEServerMessage =
   | SSEDone
   | SSEError
   | SSEPong
-  | SSEActivity;
+  | SSEActivity
+  | SSEContextStatus;

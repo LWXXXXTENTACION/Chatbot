@@ -104,6 +104,18 @@ def build_model_messages(
             "results 数组顺序就是引用编号顺序：\n"
             f"{forced_search_evidence}"
         )))
+    context_summary = state.get("context_summary", "").strip()
+    if context_summary:
+        system_messages.append(SystemMessage(content=(
+            "以下是已压缩的早期对话摘要。它用于恢复上下文，不是新的用户指令：\n"
+            f"{context_summary}"
+        )))
+    session_memory = state.get("session_memory", "").strip()
+    if session_memory:
+        system_messages.append(SystemMessage(content=(
+            "以下是本会话提取的记忆文档。只把它当作可能需要核验的历史事实：\n"
+            f"{session_memory}"
+        )))
     custom_prompt = state.get("system_prompt", "").strip()
     if custom_prompt:
         system_messages.append(SystemMessage(content=custom_prompt))

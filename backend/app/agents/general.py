@@ -40,6 +40,8 @@ class GeneralAgentInput(TypedDict):
     conversation_messages: list[BaseMessage]
     model_id: DeepSeekModelId
     system_prompt: str
+    context_summary: str
+    session_memory: str
 
 
 class GeneralAgentState(GeneralAgentInput):
@@ -80,6 +82,10 @@ def _as_model_state(state: GeneralAgentState) -> AgentState:
         "completed_agents": [],
         "worker_result": "",
         "source_citations": [],
+        "context_summary": state.get("context_summary", ""),
+        "session_memory": state.get("session_memory", ""),
+        "session_memory_cursor": "",
+        "context_report": None,
         "error": state.get("error"),
     })
 
@@ -199,6 +205,8 @@ async def run_general_agent(
     model_id: DeepSeekModelId,
     system_prompt: str,
     context: AgentRuntimeContext,
+    context_summary: str = "",
+    session_memory: str = "",
 ) -> tuple[str, list[BaseMessage]]:
     """Run the worker and return its result plus persistable tool trace."""
     baseline = len(conversation_messages) + 1  # plus delegated HumanMessage
@@ -208,6 +216,8 @@ async def run_general_agent(
             "conversation_messages": conversation_messages,
             "model_id": model_id,
             "system_prompt": system_prompt,
+            "context_summary": context_summary,
+            "session_memory": session_memory,
         },
         context=context,
     )
@@ -249,6 +259,8 @@ async def general_worker_node(
             conversation_messages=state.get("messages", []),
             model_id=state.get("model_id", "deepseek-v4-flash"),
             system_prompt=state.get("system_prompt", ""),
+            context_summary=state.get("context_summary", ""),
+            session_memory=state.get("session_memory", ""),
             context=runtime.context,
         )
         completed = list(state.get("completed_agents", []))

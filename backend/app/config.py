@@ -25,6 +25,24 @@ CONTEXT_MAX_INPUT_TOKENS = max(
     1024,
     int(os.getenv("CONTEXT_MAX_INPUT_TOKENS", "32000")),
 )
+CONTEXT_MICROCOMPACT_TTL_SECONDS = max(
+    60,
+    int(os.getenv("CONTEXT_MICROCOMPACT_TTL_SECONDS", "1800")),
+)
+CONTEXT_SESSION_MEMORY_RATIO = float(
+    os.getenv("CONTEXT_SESSION_MEMORY_RATIO", "0.45")
+)
+CONTEXT_COLLAPSE_RATIO = float(os.getenv("CONTEXT_COLLAPSE_RATIO", "0.62"))
+CONTEXT_FULL_COMPACT_RATIO = float(
+    os.getenv("CONTEXT_FULL_COMPACT_RATIO", "0.82")
+)
+CONTEXT_PTL_TRUNCATION_RATIO = float(
+    os.getenv("CONTEXT_PTL_TRUNCATION_RATIO", "0.95")
+)
+CONTEXT_KEEP_RECENT_TURNS = max(
+    1,
+    int(os.getenv("CONTEXT_KEEP_RECENT_TURNS", "2")),
+)
 
 # JWT
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-in-production")

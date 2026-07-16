@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -94,6 +95,9 @@ async def _execute_one(
             tool_call_id=call_id,
             name=name,
             status=status,  # type: ignore[arg-type]
+            additional_kwargs={
+                "context_created_at": datetime.now(timezone.utc).isoformat(),
+            },
             id=uuid.uuid4().hex,
         ),
         citations,

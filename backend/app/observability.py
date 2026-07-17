@@ -21,7 +21,7 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 
 
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSION = 2
 MAX_TIMELINE_EVENTS = 160
 
 
@@ -128,6 +128,11 @@ class TraceCollector:
         self._total_tokens = 0
         self._tool_calls = 0
         self._tool_errors = 0
+        self._tool_rejections = 0
+        self._tool_timeouts = 0
+        self._tool_duration_ms = 0
+        self._tool_output_chars = 0
+        self._tool_truncations = 0
         self._cache_hits = 0
         self._sources = 0
         self._context: dict[str, Any] = {}
@@ -175,13 +180,40 @@ class TraceCollector:
         elif event_type == "tool_result":
             cached = bool(event.get("cached"))
             error = event.get("error")
+            rejection_reason = str(event.get("rejectionReason") or "")
+            timeout_reason = str(event.get("timeoutReason") or "")
+            duration_ms = _integer(event.get("durationMs"))
+            output_chars = _integer(event.get("outputChars"))
+            truncated = bool(event.get("outputTruncated"))
             self._cache_hits += int(cached)
             self._tool_errors += int(bool(error))
+            self._tool_rejections += int(bool(rejection_reason))
+            self._tool_timeouts += int(bool(timeout_reason))
+            self._tool_duration_ms += duration_ms
+            self._tool_output_chars += output_chars
+            self._tool_truncations += int(truncated)
+            if rejection_reason:
+                label = f"工具调用被策略拒绝：{rejection_reason}"
+            elif timeout_reason:
+                label = "工具执行超时"
+            elif cached:
+                label = "工具返回缓存结果"
+            else:
+                label = "工具执行完成"
             self._append(
                 "tool.end",
-                "工具返回缓存结果" if cached else "工具执行完成",
+                label,
                 status="error" if error else "completed",
-                metadata={"cached": cached, "error": bool(error)},
+                metadata={
+                    "cached": cached,
+                    "error": bool(error),
+                    "duration_ms": duration_ms,
+                    "output_chars": output_chars,
+                    "model_output_chars": _integer(event.get("modelOutputChars")),
+                    "output_truncated": truncated,
+                    "rejection_reason": rejection_reason or None,
+                    "timeout_reason": timeout_reason or None,
+                },
             )
         elif event_type == "context_status":
             self._context = {
@@ -283,6 +315,11 @@ class TraceCollector:
                 "llm_calls": len(self._llm_runs),
                 "tool_calls": self._tool_calls,
                 "tool_errors": self._tool_errors,
+                "tool_rejections": self._tool_rejections,
+                "tool_timeouts": self._tool_timeouts,
+                "tool_duration_ms": self._tool_duration_ms,
+                "tool_output_chars": self._tool_output_chars,
+                "tool_truncations": self._tool_truncations,
                 "cache_hits": self._cache_hits,
                 "sources": self._sources,
             },

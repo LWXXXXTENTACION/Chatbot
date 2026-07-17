@@ -6,11 +6,25 @@ The content streams through the tool input; execution is a no-op acknowledgement
 from typing import Literal
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, ConfigDict, Field
+
+MAX_ARTIFACT_CONTENT_CHARS = 100_000
 
 ArtifactKind = Literal["code", "html", "markdown", "svg"]
 
 
-@tool
+class CreateArtifactInput(BaseModel):
+    """Strict, bounded input accepted by the artifact renderer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=120)
+    kind: ArtifactKind
+    content: str = Field(min_length=1, max_length=MAX_ARTIFACT_CONTENT_CHARS)
+    language: str | None = Field(default=None, max_length=40)
+
+
+@tool(args_schema=CreateArtifactInput)
 def create_artifact(
     title: str,
     kind: ArtifactKind,

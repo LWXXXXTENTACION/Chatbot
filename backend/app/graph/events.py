@@ -66,6 +66,13 @@ class ToolResultEvent(TypedDict):
     result: Any
     cached: NotRequired[bool]
     error: str | None
+    status: NotRequired[Literal["success", "error", "rejected", "timeout"]]
+    durationMs: NotRequired[int]
+    outputChars: NotRequired[int]
+    modelOutputChars: NotRequired[int]
+    outputTruncated: NotRequired[bool]
+    rejectionReason: NotRequired[str | None]
+    timeoutReason: NotRequired[str | None]
 
 
 class SourcesEvent(TypedDict):

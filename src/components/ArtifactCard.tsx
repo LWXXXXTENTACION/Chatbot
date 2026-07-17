@@ -13,6 +13,7 @@ import type { LucideIcon } from "lucide-react";
 import { useChatStore } from "@/lib/store";
 import type { Artifact, ArtifactKind } from "@/lib/types";
 import { extractArtifactFields } from "@/lib/partial-json";
+import { limitArtifactContent } from "@/lib/artifact-security";
 
 interface CreateArtifactInput {
   title?: string;
@@ -71,7 +72,7 @@ export function ArtifactCard({ toolCallId, state, input, conversationId }: Artif
 
   const kind: ArtifactKind = resolved.kind ?? "code";
   const title = resolved.title ?? "未命名工件";
-  const content = resolved.content ?? "";
+  const content = limitArtifactContent(resolved.content);
   const streaming = state === "input-streaming";
   const meta = KIND_META[kind] ?? KIND_META.code;
   const Icon = meta.icon;

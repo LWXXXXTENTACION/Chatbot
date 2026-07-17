@@ -17,6 +17,10 @@ import type {
   SearchMode,
 } from "@/lib/types";
 import { extractArtifactFields } from "@/lib/partial-json";
+import {
+  limitArtifactContent,
+  MAX_ARTIFACT_TOOL_INPUT_CHARS,
+} from "@/lib/artifact-security";
 import { useChatStore } from "@/lib/store";
 import { fetchWithAuth } from "@/lib/auth";
 
@@ -280,7 +284,9 @@ export function useChatStream({
         const tc = toolCallsRef.current.get(data.toolCallId);
         if (tc) {
           const prevInput = (tc.input as string) || "";
-          const rawInput = prevInput + data.delta;
+          const rawInput = tc.type === "tool-create_artifact"
+            ? (prevInput + data.delta).slice(0, MAX_ARTIFACT_TOOL_INPUT_CHARS)
+            : prevInput + data.delta;
           const next: ToolPartBase = { ...tc, input: rawInput };
 
           // Incremental artifact parsing: extract fields from partial JSON
@@ -296,7 +302,7 @@ export function useChatStream({
                 title: partial.title || "未命名工件",
                 kind: (partial.kind as ArtifactKind) || "code",
                 language: partial.language,
-                content: partial.content || "",
+                content: limitArtifactContent(partial.content),
                 streaming: true,
               });
             }
@@ -307,7 +313,7 @@ export function useChatStream({
                 title: partial.title || "未命名工件",
                 kind: (partial.kind as ArtifactKind) || "code",
                 language: partial.language,
-                content: partial.content || "",
+                content: limitArtifactContent(partial.content),
                 streaming: true,
               });
             }
@@ -344,7 +350,9 @@ export function useChatStream({
               kind: (pi.kind as ArtifactKind) || "code",
               language:
                 typeof pi.language === "string" ? pi.language : undefined,
-              content: typeof pi.content === "string" ? pi.content : "",
+              content: limitArtifactContent(
+                typeof pi.content === "string" ? pi.content : "",
+              ),
               streaming: false,
             });
           }

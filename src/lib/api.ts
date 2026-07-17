@@ -56,6 +56,11 @@ export interface TraceMetrics {
   llm_calls: number;
   tool_calls: number;
   tool_errors: number;
+  tool_rejections: number;
+  tool_timeouts: number;
+  tool_duration_ms: number;
+  tool_output_chars: number;
+  tool_truncations: number;
   cache_hits: number;
   sources: number;
 }
@@ -132,6 +137,14 @@ export interface ObservabilityVersion {
   avg_tokens: number;
   llm_calls: number;
   tool_calls: number;
+  tool_errors: number;
+  tool_rejections: number;
+  tool_timeouts: number;
+  tool_duration_ms: number;
+  tool_output_chars: number;
+  tool_truncations: number;
+  avg_tool_duration_ms: number;
+  avg_tool_output_chars: number;
   avg_duration_ms: number;
   evaluated_runs: number;
   passed_runs: number;

@@ -162,6 +162,24 @@ function EmptyState() {
 
 function TimelineItem({ event }: { event: TraceTimelineEvent }) {
   const error = event.status === "error";
+  const metadata = event.metadata;
+  const toolDetail = event.type === "tool.end"
+    ? [
+        typeof metadata.duration_ms === "number"
+          ? formatDuration(metadata.duration_ms)
+          : null,
+        typeof metadata.output_chars === "number"
+          ? `${formatCompact(metadata.output_chars)} chars`
+          : null,
+        metadata.output_truncated ? "已裁剪" : null,
+        typeof metadata.rejection_reason === "string"
+          ? metadata.rejection_reason
+          : null,
+        typeof metadata.timeout_reason === "string"
+          ? metadata.timeout_reason
+          : null,
+      ].filter(Boolean).join(" · ")
+    : "";
   return (
     <li className="group relative grid grid-cols-[44px_1fr] gap-3 pb-5 last:pb-0">
       <div className="relative flex justify-center">
@@ -182,6 +200,11 @@ function TimelineItem({ event }: { event: TraceTimelineEvent }) {
         <p className="mt-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-[var(--fg-subtle)]">
           {event.type}
         </p>
+        {toolDetail ? (
+          <p className="mt-1 text-[10px] leading-4 text-[var(--fg-muted)]">
+            {toolDetail}
+          </p>
+        ) : null}
       </div>
     </li>
   );
@@ -253,10 +276,14 @@ function RunInspector({
           ["耗时", formatDuration(run.duration_ms)],
           ["LLM 调用", formatNumber(run.metrics.llm_calls)],
           ["工具调用", formatNumber(run.metrics.tool_calls)],
+          ["策略拒绝", formatNumber(run.metrics.tool_rejections ?? 0)],
+          ["工具超时", formatNumber(run.metrics.tool_timeouts ?? 0)],
+          ["工具输出", `${formatCompact(run.metrics.tool_output_chars ?? 0)} 字符`],
+          ["结果裁剪", formatNumber(run.metrics.tool_truncations ?? 0)],
         ].map(([label, value], index) => (
           <div
             key={label}
-            className={`px-5 py-4 ${index % 2 === 0 ? "border-r" : ""} ${index < 2 ? "border-b" : ""} border-[var(--border)]`}
+            className={`px-5 py-4 ${index % 2 === 0 ? "border-r" : ""} ${index < 6 ? "border-b" : ""} border-[var(--border)]`}
           >
             <p className="text-[10px] text-[var(--fg-subtle)]">{label}</p>
             <p className="mt-1 font-mono text-lg font-semibold">{value}</p>
@@ -600,27 +627,35 @@ export function ObservabilityDashboard() {
             <div>
               <div className="border-b border-[var(--border-strong)] pb-3">
                 <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--fg-subtle)]">04 / Expansion</p>
-                <h2 className="mt-1 text-lg font-semibold tracking-tight">执行膨胀</h2>
+                <h2 className="mt-1 text-lg font-semibold tracking-tight">执行与工具开销</h2>
               </div>
               <div className="mt-4 overflow-hidden border-y border-[var(--border)]">
-                <div className="grid grid-cols-[1fr_70px_70px] py-2 text-[9px] uppercase tracking-[0.1em] text-[var(--fg-subtle)]">
-                  <span>版本</span><span className="text-right">LLM</span><span className="text-right">工具</span>
+                <div className="grid grid-cols-[1fr_52px_52px_58px_70px] py-2 text-[9px] uppercase tracking-[0.1em] text-[var(--fg-subtle)]">
+                  <span>版本</span><span className="text-right">LLM</span><span className="text-right">工具</span><span className="text-right">拒绝</span><span className="text-right">工具耗时</span>
                 </div>
                 {versions.map((version, index) => (
-                  <div key={version.id} className="grid grid-cols-[1fr_70px_70px] items-center border-t border-[var(--border)] py-3 text-xs">
+                  <div key={version.id} className="grid grid-cols-[1fr_52px_52px_58px_70px] items-center border-t border-[var(--border)] py-3 text-xs">
                     <span className="flex min-w-0 items-center gap-2">
                       <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: VERSION_COLORS[index] }} />
                       <span className="truncate">{version.label}</span>
                     </span>
                     <span className="text-right font-mono font-semibold">{version.llm_calls}</span>
                     <span className="text-right font-mono font-semibold">{version.tool_calls}</span>
+                    <span className="text-right font-mono font-semibold">{version.tool_rejections ?? 0}</span>
+                    <span className="text-right font-mono font-semibold">{formatDuration(version.avg_tool_duration_ms ?? 0)}</span>
                   </div>
                 ))}
               </div>
               {versions[0] ? (
-                <div className="mt-4 flex items-center justify-between rounded-lg bg-[var(--bg-subtle)] px-3 py-2 text-[10px]">
-                  <span className="text-[var(--fg-muted)]">当前版平均耗时对比上一版</span>
-                  <MetricDelta current={versions[0].avg_duration_ms} previous={previousVersion?.avg_duration_ms} />
+                <div className="mt-4 space-y-2 rounded-lg bg-[var(--bg-subtle)] px-3 py-2 text-[10px]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[var(--fg-muted)]">当前版整轮耗时对比上一版</span>
+                    <MetricDelta current={versions[0].avg_duration_ms} previous={previousVersion?.avg_duration_ms} />
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[var(--fg-muted)]">单次工具输出字符对比上一版</span>
+                    <MetricDelta current={versions[0].avg_tool_output_chars ?? 0} previous={previousVersion?.avg_tool_output_chars} />
+                  </div>
                 </div>
               ) : null}
             </div>

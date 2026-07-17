@@ -181,6 +181,13 @@ export interface SSEToolResult {
   result: unknown;
   cached?: boolean;
   error: string | null;
+  status?: "success" | "error" | "rejected" | "timeout";
+  durationMs?: number;
+  outputChars?: number;
+  modelOutputChars?: number;
+  outputTruncated?: boolean;
+  rejectionReason?: string | null;
+  timeoutReason?: string | null;
 }
 
 export interface SSESources {

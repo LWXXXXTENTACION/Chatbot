@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { Check, Code2, Copy, Eye, Loader2, X } from "lucide-react";
 import { useChatStore } from "@/lib/store";
+import { limitArtifactContent, secureArtifactPreview } from "@/lib/artifact-security";
 import { Markdown } from "./Markdown";
 
 export function ArtifactPanel() {
@@ -21,12 +22,12 @@ export function ArtifactPanel() {
   const previewDoc = useMemo(() => {
     if (!artifact || artifact.streaming) return "";
     if (artifact.kind === "svg") {
-      return `<!doctype html><html><head><meta charset="utf-8"><style>
+      return secureArtifactPreview(`<style>
         html,body{margin:0;height:100%;display:grid;place-items:center;background:#fff}
         svg{max-width:100%;max-height:100%}
-      </style></head><body>${artifact.content}</body></html>`;
+      </style>${limitArtifactContent(artifact.content)}`);
     }
-    return artifact.content;
+    return secureArtifactPreview(artifact.content);
   }, [artifact]);
 
   if (!artifact) return null;
@@ -114,7 +115,8 @@ export function ArtifactPanel() {
         {effectiveTab === "preview" && canPreview ? (
           <iframe
             title={artifact.title}
-            sandbox="allow-scripts allow-same-origin"
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
             className="h-full w-full border-0 bg-white"
             srcDoc={previewDoc}
           />

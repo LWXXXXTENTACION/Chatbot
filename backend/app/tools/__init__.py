@@ -5,10 +5,11 @@ from app.tools.calculate import calculate
 from app.tools.artifact import create_artifact
 from app.tools.deep_search import deep_search
 from app.tools.web_search import web_search
+from app.tools.registry import TOOL_REGISTRY
 
-STANDARD_TOOLS = [get_weather, calculate, create_artifact]
-GENERAL_AGENT_TOOLS = STANDARD_TOOLS
-RESEARCH_AGENT_TOOLS = [web_search, deep_search]
+GENERAL_AGENT_TOOLS = TOOL_REGISTRY.tools_for("general_agent")
+RESEARCH_AGENT_TOOLS = TOOL_REGISTRY.tools_for("research_agent")
+STANDARD_TOOLS = GENERAL_AGENT_TOOLS
 
 __all__ = [
     "get_weather",
@@ -19,4 +20,5 @@ __all__ = [
     "STANDARD_TOOLS",
     "GENERAL_AGENT_TOOLS",
     "RESEARCH_AGENT_TOOLS",
+    "TOOL_REGISTRY",
 ]

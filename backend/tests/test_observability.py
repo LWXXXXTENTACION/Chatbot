@@ -73,6 +73,10 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "toolCallId": "tool-1",
         "cached": True,
         "error": None,
+        "durationMs": 25,
+        "outputChars": 100,
+        "modelOutputChars": 80,
+        "outputTruncated": True,
     })
     collector.model_started("llm-1", model_name="deepseek-v4-flash")
     result = LLMResult(generations=[[
@@ -97,6 +101,11 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "llm_calls": 1,
         "tool_calls": 1,
         "tool_errors": 0,
+        "tool_rejections": 0,
+        "tool_timeouts": 0,
+        "tool_duration_ms": 25,
+        "tool_output_chars": 100,
+        "tool_truncations": 1,
         "cache_hits": 1,
         "sources": 0,
     }

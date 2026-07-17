@@ -1,9 +1,11 @@
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agents import general, research, supervisor
@@ -13,6 +15,13 @@ from app.graph.builder import build_graph
 from app.graph.context import AgentRuntimeContext
 from app.graph.routing import route_supervisor
 from app.tools import GENERAL_AGENT_TOOLS, RESEARCH_AGENT_TOOLS
+from app.tools.registry import (
+    MAX_ARTIFACT_CONTENT_CHARS,
+    MAX_BATCH_TOOL_CALLS,
+    MAX_CONCURRENT_TOOLS,
+    MAX_TURN_TOOL_CALLS,
+    TOOL_REGISTRY,
+)
 
 
 def base_state(**overrides):
@@ -372,7 +381,246 @@ def test_general_agent_rejects_search_tools():
         writer=noop_writer,
     ))
     assert messages[0].status == "error"
-    assert "只允许一个搜索任务" in json.loads(messages[0].content)["error"]
+    assert json.loads(messages[0].content)["code"] == "tool_not_allowed"
+
+
+def test_tool_policy_limits_batch_concurrency_and_output(monkeypatch):
+    tracker = {"active": 0, "peak": 0, "calls": 0}
+
+    async def large_calculation(expression: str):
+        tracker["active"] += 1
+        tracker["calls"] += 1
+        tracker["peak"] = max(tracker["peak"], tracker["active"])
+        await asyncio.sleep(0.02)
+        tracker["active"] -= 1
+        return {"expression": expression, "payload": "x" * 20_000}
+
+    original = TOOL_REGISTRY.get("calculate", "general_agent")
+    assert original is not None
+    fake_tool = StructuredTool.from_function(
+        coroutine=large_calculation,
+        name="calculate",
+        description="bounded test calculator",
+    )
+    monkeypatch.setitem(
+        TOOL_REGISTRY._policies,
+        "calculate",
+        replace(
+            original,
+            tool=fake_tool,
+            max_model_output_chars=1_000,
+            max_display_output_chars=2_000,
+        ),
+    )
+    events = []
+    calls = [{
+        "id": f"calc-{index}",
+        "name": "calculate",
+        "args": {"expression": "1+1"},
+        "type": "tool_call",
+    } for index in range(8)]
+
+    messages = asyncio.run(tool_execution.execute_general_tool_batch(
+        calls,
+        model_id="deepseek-v4-flash",
+        context=runtime().context,
+        writer=events.append,
+    ))
+
+    assert MAX_BATCH_TOOL_CALLS == MAX_CONCURRENT_TOOLS == 3
+    assert tracker == {"active": 0, "peak": 3, "calls": 3}
+    assert len(messages) == 8
+    assert all(len(str(message.content)) <= 1_000 for message in messages[:3])
+    assert [
+        json.loads(message.content).get("code") for message in messages[3:]
+    ] == ["batch_call_limit"] * 5
+    completed_events = [event for event in events if event["status"] == "success"]
+    assert all(event["outputTruncated"] for event in completed_events)
+    assert all(
+        len(json.dumps(event["result"], ensure_ascii=False, separators=(",", ":")))
+        <= 2_000
+        for event in completed_events
+    )
+
+
+def test_tool_policy_limits_total_calls_across_batches():
+    context = runtime().context
+    call_index = 0
+
+    async def execute(count):
+        nonlocal call_index
+        calls = []
+        for _ in range(count):
+            calls.append({
+                "id": f"calc-{call_index}",
+                "name": "calculate",
+                "args": {"expression": "1+1"},
+                "type": "tool_call",
+            })
+            call_index += 1
+        return await tool_execution.execute_general_tool_batch(
+            calls,
+            model_id="deepseek-v4-flash",
+            context=context,
+            writer=noop_writer,
+        )
+
+    first, second, third = asyncio.run(_three_batches(execute))
+    assert all(message.status == "success" for message in [*first, *second])
+    assert json.loads(third[0].content)["code"] == "turn_call_limit"
+    assert context.tool_budget.total_calls == MAX_TURN_TOOL_CALLS == 6
+
+
+async def _three_batches(execute):
+    return await execute(3), await execute(3), await execute(1)
+
+
+def test_tool_policy_limits_deep_search_and_artifact_per_turn(monkeypatch):
+    searches = 0
+
+    async def fake_deep_search(**kwargs):
+        nonlocal searches
+        searches += 1
+        return {
+            "summary": "ok",
+            "query": kwargs["query"],
+            "results": [{
+                "title": "Source",
+                "url": "https://example.com",
+                "content": "Evidence",
+            }],
+        }
+
+    monkeypatch.setattr(tool_execution, "run_deep_search_workflow", fake_deep_search)
+    search_context = runtime().context
+
+    async def search(query, call_id):
+        return await tool_execution.execute_tool_batch(
+            base_state(messages=[AIMessage(content="", tool_calls=[{
+                "id": call_id,
+                "name": "deep_search",
+                "args": {"query": query},
+                "type": "tool_call",
+            }])]),
+            search_context,
+            noop_writer,
+        )
+
+    first_search, second_search = asyncio.run(_two_searches(search))
+    assert searches == 1
+    assert first_search["state_patch"]["source_citations"][0]["title"] == "Source"
+    assert json.loads(second_search["messages"][0].content)["code"] == (
+        "deep_search_turn_limit"
+    )
+
+    artifact_context = runtime().context
+    artifact_call = lambda call_id, content: {
+        "id": call_id,
+        "name": "create_artifact",
+        "args": {"title": "demo", "kind": "html", "content": content},
+        "type": "tool_call",
+    }
+    first_artifact = asyncio.run(tool_execution.execute_general_tool_batch(
+        [artifact_call("artifact-1", "<p>safe</p>")],
+        model_id="deepseek-v4-flash",
+        context=artifact_context,
+        writer=noop_writer,
+    ))
+    second_artifact = asyncio.run(tool_execution.execute_general_tool_batch(
+        [artifact_call("artifact-2", "<p>again</p>")],
+        model_id="deepseek-v4-flash",
+        context=artifact_context,
+        writer=noop_writer,
+    ))
+    oversized = asyncio.run(tool_execution.execute_general_tool_batch(
+        [artifact_call("artifact-large", "x" * (MAX_ARTIFACT_CONTENT_CHARS + 1))],
+        model_id="deepseek-v4-flash",
+        context=runtime().context,
+        writer=noop_writer,
+    ))
+    assert first_artifact[0].status == "success"
+    assert json.loads(second_artifact[0].content)["code"] == (
+        "create_artifact_turn_limit"
+    )
+    assert json.loads(oversized[0].content)["code"] == "schema_validation_failed"
+
+
+async def _two_searches(search):
+    return await search("first", "deep-1"), await search("second", "deep-2")
+
+
+def test_tool_policy_enforces_schema_state_patch_and_timeout(monkeypatch):
+    invalid = asyncio.run(tool_execution.execute_general_tool_batch(
+        [{
+            "id": "invalid",
+            "name": "calculate",
+            "args": {},
+            "type": "tool_call",
+        }],
+        model_id="deepseek-v4-flash",
+        context=runtime().context,
+        writer=noop_writer,
+    ))
+    assert json.loads(invalid[0].content)["code"] == "schema_validation_failed"
+
+    async def fake_deep_search(**_kwargs):
+        return {"summary": "ok", "results": []}
+
+    monkeypatch.setattr(tool_execution, "run_deep_search_workflow", fake_deep_search)
+    patch_result = asyncio.run(tool_execution.execute_tool_batch(
+        base_state(messages=[AIMessage(content="", tool_calls=[
+            {
+                "id": "patch-1",
+                "name": "deep_search",
+                "args": {"query": "one"},
+                "type": "tool_call",
+            },
+            {
+                "id": "patch-2",
+                "name": "deep_search",
+                "args": {"query": "two"},
+                "type": "tool_call",
+            },
+        ])]),
+        runtime().context,
+        noop_writer,
+    ))
+    assert patch_result["messages"][0].status == "success"
+    assert json.loads(patch_result["messages"][1].content)["code"] == (
+        "state_patch_conflict"
+    )
+
+    async def slow_calculation(expression: str):
+        await asyncio.sleep(0.05)
+        return {"expression": expression, "result": 2}
+
+    original = TOOL_REGISTRY.get("calculate", "general_agent")
+    assert original is not None
+    slow_tool = StructuredTool.from_function(
+        coroutine=slow_calculation,
+        name="calculate",
+        description="slow test calculator",
+    )
+    monkeypatch.setitem(
+        TOOL_REGISTRY._policies,
+        "calculate",
+        replace(original, tool=slow_tool, timeout_seconds=0.01),
+    )
+    events = []
+    timed_out = asyncio.run(tool_execution.execute_general_tool_batch(
+        [{
+            "id": "slow",
+            "name": "calculate",
+            "args": {"expression": "1+1"},
+            "type": "tool_call",
+        }],
+        model_id="deepseek-v4-flash",
+        context=runtime().context,
+        writer=events.append,
+    ))
+    assert json.loads(timed_out[0].content)["code"] == "tool_timeout"
+    assert events[0]["status"] == "timeout"
+    assert events[0]["timeoutReason"]
 
 
 def test_general_agent_tool_loop_stops_with_only_complete_protocol_pairs(monkeypatch):

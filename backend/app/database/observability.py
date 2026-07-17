@@ -153,6 +153,12 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "output_tokens": 0,
             "llm_calls": 0,
             "tool_calls": 0,
+            "tool_errors": 0,
+            "tool_rejections": 0,
+            "tool_timeouts": 0,
+            "tool_duration_ms": 0,
+            "tool_output_chars": 0,
+            "tool_truncations": 0,
             "duration_ms": 0,
             "evaluated_runs": 0,
             "passed_runs": 0,
@@ -165,6 +171,12 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         group["output_tokens"] += _number(metrics.get("output_tokens"))
         group["llm_calls"] += _number(metrics.get("llm_calls"))
         group["tool_calls"] += _number(metrics.get("tool_calls"))
+        group["tool_errors"] += _number(metrics.get("tool_errors"))
+        group["tool_rejections"] += _number(metrics.get("tool_rejections"))
+        group["tool_timeouts"] += _number(metrics.get("tool_timeouts"))
+        group["tool_duration_ms"] += _number(metrics.get("tool_duration_ms"))
+        group["tool_output_chars"] += _number(metrics.get("tool_output_chars"))
+        group["tool_truncations"] += _number(metrics.get("tool_truncations"))
         group["duration_ms"] += _number(trace.get("duration_ms"))
         if evaluation is not None and isinstance(evaluation.get("passed"), bool):
             group["evaluated_runs"] += 1
@@ -186,6 +198,16 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evaluated = group["evaluated_runs"]
         group["avg_tokens"] = round(group["total_tokens"] / runs) if runs else 0
         group["avg_duration_ms"] = round(group.pop("duration_ms") / runs) if runs else 0
+        group["avg_tool_duration_ms"] = (
+            round(group["tool_duration_ms"] / group["tool_calls"])
+            if group["tool_calls"]
+            else 0
+        )
+        group["avg_tool_output_chars"] = (
+            round(group["tool_output_chars"] / group["tool_calls"])
+            if group["tool_calls"]
+            else 0
+        )
         group["success_rate"] = round(group["successful_runs"] / runs, 4) if runs else 0
         group["pass_rate"] = (
             round(group["passed_runs"] / evaluated, 4) if evaluated else None

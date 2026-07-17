@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Brain, ChevronDown, MessageCircle } from "lucide-react";
 import { Markdown } from "./Markdown";
 import { ToolInvocation } from "./ToolInvocation";
@@ -17,7 +17,7 @@ interface MessageBubbleProps {
 
 type AnyPart = ChatUIMessage["parts"][number];
 
-export function MessageBubble({ message, isStreaming, conversationId }: MessageBubbleProps) {
+function MessageBubbleImpl({ message, isStreaming, conversationId }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
   const storedSources = useChatStore((s) => s.messageSources[message.id]);
@@ -32,7 +32,7 @@ export function MessageBubble({ message, isStreaming, conversationId }: MessageB
       .map((p) => (p as { text: string }).text)
       .join("");
     return (
-      <div className="fade-in-up flex justify-end gap-3" data-role="user">
+      <div className="message-frame fade-in-up flex justify-end gap-3" data-role="user">
         <div className="flex max-w-[78%] flex-col items-end">
           <div className="rounded-2xl rounded-tr-md bg-[var(--user-bubble)] px-4 py-2.5 text-[var(--user-bubble-fg)] shadow-[var(--shadow-sm)]">
             <p className="whitespace-pre-wrap text-[14.5px] leading-relaxed">
@@ -55,7 +55,7 @@ export function MessageBubble({ message, isStreaming, conversationId }: MessageB
   );
 
   return (
-    <div className="fade-in-up flex justify-start gap-3" data-role="assistant">
+    <div className="message-frame fade-in-up flex justify-start gap-3" data-role="assistant">
       <div className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border-strong)] bg-[var(--accent-soft)] text-[var(--accent-strong)]">
         <MessageCircle className="h-4 w-4" strokeWidth={2.1} />
       </div>
@@ -80,6 +80,8 @@ export function MessageBubble({ message, isStreaming, conversationId }: MessageB
   );
 }
 
+export const MessageBubble = memo(MessageBubbleImpl);
+
 function PartView({
   part,
   streaming,
@@ -94,7 +96,7 @@ function PartView({
   if (part.type === "text") {
     const text = (part as { text: string }).text;
     if (!text) return null;
-    return <Markdown sources={sources}>{text}</Markdown>;
+    return <Markdown sources={sources} streaming={streaming}>{text}</Markdown>;
   }
 
   if (part.type === "reasoning") {
@@ -172,7 +174,7 @@ function ReasoningBlock({
       </button>
       {open ? (
         <div className="border-t border-[var(--border)] px-3.5 py-3 text-[13px] leading-relaxed text-[var(--fg-muted)]">
-          <Markdown>{text}</Markdown>
+          <Markdown streaming={streaming}>{text}</Markdown>
         </div>
       ) : null}
     </div>

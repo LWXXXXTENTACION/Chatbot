@@ -236,6 +236,28 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* During token streaming, syntax highlighting is intentionally deferred.
+   The final frame receives the full highlighter pass once. */
+.markdown-streaming pre code {
+  color: var(--fg);
+}
+
+/* Browser equivalent of a retained screen region: off-screen messages keep
+   an intrinsic size and skip layout/paint until they approach the viewport. */
+.message-frame {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 160px;
+}
+
+.render-surface {
+  overflow-anchor: auto;
+  scrollbar-gutter: stable;
+}
+
+.composer-shell {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
 /* =========================================================
    Responsive inline source span links & source footnotes
    ========================================================= */
@@ -402,6 +424,19 @@ body {
   .shimmer-text,
   .typing-dot {
     animation: none !important;
+  }
+
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (max-width: 640px) {
+  .markdown table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    white-space: nowrap;
   }
 }
 

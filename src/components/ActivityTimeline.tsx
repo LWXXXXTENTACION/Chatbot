@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { Brain, Search, FileText, PenLine, RefreshCw, Minimize2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { Activity } from "@/lib/types";
@@ -13,7 +14,7 @@ const ACTIVITY_ICONS: Record<Activity["kind"], LucideIcon> = {
   compacting: Minimize2,
 };
 
-export function ActivityTimeline({ activities }: { activities: Activity[] }) {
+function ActivityTimelineImpl({ activities }: { activities: Activity[] }) {
   if (!activities.length) return null;
 
   return (
@@ -41,3 +42,5 @@ export function ActivityTimeline({ activities }: { activities: Activity[] }) {
     </div>
   );
 }
+
+export const ActivityTimeline = memo(ActivityTimelineImpl);

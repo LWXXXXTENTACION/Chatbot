@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { ArrowUp, Globe2, Square, Telescope, type LucideIcon } from "lucide-react";
 import type { SearchMode } from "@/lib/types";
 
@@ -40,7 +40,7 @@ const SEARCH_OPTIONS: Array<{
   },
 ];
 
-export function ChatComposer({
+function ChatComposerImpl({
   value,
   onChange,
   onSubmit,
@@ -150,3 +150,5 @@ export function ChatComposer({
     </form>
   );
 }
+
+export const ChatComposer = memo(ChatComposerImpl);

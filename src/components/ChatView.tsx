@@ -1,11 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  ArrowDown,
   Code2,
   Compass,
   Lightbulb,
+  Menu,
   MessageSquareText,
   PencilLine,
 } from "lucide-react";
@@ -20,6 +22,7 @@ import { useChatStream } from "@/hooks/useChatStream";
 
 interface ChatViewProps {
   conversation: Conversation;
+  onOpenSidebar: () => void;
 }
 
 const SUGGESTIONS = [
@@ -45,7 +48,7 @@ const SUGGESTIONS = [
   },
 ];
 
-export function ChatView({ conversation }: ChatViewProps) {
+export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
   const setStoreMessages = useChatStore((s) => s.setMessages);
   const setStoreTitle = useChatStore((s) => s.setTitle);
   const setStoreModel = useChatStore((s) => s.setModel);
@@ -54,8 +57,9 @@ export function ChatView({ conversation }: ChatViewProps) {
   const [input, setInput] = useState("");
   const [model, setModel] = useState<DeepSeekModelId>(conversation.model);
   const [searchMode, setSearchMode] = useState<SearchMode>("auto");
+  const [followingLatest, setFollowingLatest] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollFrameRef = useRef<number | null>(null);
 
   const { messages, sendMessage, status, error, stop, activities } =
     useChatStream({
@@ -73,6 +77,7 @@ export function ChatView({ conversation }: ChatViewProps) {
 
   useEffect(() => {
     setSearchMode("auto");
+    setFollowingLatest(true);
   }, [conversation.id]);
 
   // Persist latest messages to store on unmount so no data is lost
@@ -102,39 +107,86 @@ export function ChatView({ conversation }: ChatViewProps) {
     }
   }, [messages, conversation.id, conversation.title, setStoreTitle]);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, status]);
-
   const isEmpty = messages.length === 0;
   // Show "busy" when either hook is streaming or store says this conversation is streaming
   const busy = status === "streaming" || status === "submitted" || isStoreStreaming;
 
-  function handleSend(textOverride?: string) {
+  useEffect(() => {
+    if (!followingLatest) return;
+    if (scrollFrameRef.current !== null) {
+      cancelAnimationFrame(scrollFrameRef.current);
+    }
+    scrollFrameRef.current = requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const scroller = scrollRef.current;
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    });
+    return () => {
+      if (scrollFrameRef.current !== null) {
+        cancelAnimationFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+    };
+  }, [messages, activities, status, followingLatest]);
+
+  const handleScroll = useCallback(() => {
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    const nextFollowing = distanceFromBottom < 96;
+    setFollowingLatest((current) => current === nextFollowing ? current : nextFollowing);
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    setFollowingLatest(true);
+    const scroller = scrollRef.current;
+    if (scroller) {
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+    }
+  }, []);
+
+  const handleSend = useCallback((textOverride?: string) => {
     const text = (textOverride ?? input).trim();
     if (!text || busy) return;
+    setFollowingLatest(true);
     sendMessage({ text }, { body: { model, searchMode } });
     setInput("");
-  }
+  }, [busy, input, model, searchMode, sendMessage]);
 
-  function handleModelChange(next: DeepSeekModelId) {
+  const handleModelChange = useCallback((next: DeepSeekModelId) => {
     setModel(next);
     if (!modelSupportsTools(next)) {
       setSearchMode("auto");
     }
     setStoreModel(conversation.id, next);
-  }
+  }, [conversation.id, setStoreModel]);
 
   return (
-    <section className="flex h-full flex-1 flex-col">
+    <section className="relative flex h-full min-w-0 flex-1 flex-col">
       {/* Header */}
-      <header className="glass z-10 flex items-center justify-between border-b border-[var(--border)] px-5 py-3">
-        <div className="flex items-center gap-3">
+      <header className="glass z-10 flex min-h-16 items-center justify-between gap-3 border-b border-[var(--border)] px-3 py-3 sm:px-5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <button
+            type="button"
+            onClick={onOpenSidebar}
+            className="focus-ring grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-[var(--border)] bg-[var(--bg-elev)] text-[var(--fg-muted)] shadow-[var(--shadow-sm)] md:hidden"
+            aria-label="打开对话列表"
+          >
+            <Menu className="h-4 w-4" />
+          </button>
           <ModelSelector
             value={model}
             onChange={handleModelChange}
             disabled={busy}
           />
+          <div className="hidden min-w-0 border-l border-[var(--border)] pl-3 lg:block">
+            <p className="max-w-52 truncate text-xs font-medium text-[var(--fg-muted)]">
+              {conversation.title || "新对话"}
+            </p>
+            <p className="mt-0.5 font-mono text-[8px] uppercase tracking-[0.14em] text-[var(--fg-subtle)]">
+              Active thread
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-2 text-[11.5px]">
           <span
@@ -157,8 +209,12 @@ export function ChatView({ conversation }: ChatViewProps) {
       </header>
 
       {/* Messages */}
-      <div ref={scrollRef} className="scrollbar-thin flex-1 overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-7 px-5 pt-8 pb-10">
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="render-surface scrollbar-thin min-h-0 flex-1 overflow-y-auto overscroll-contain"
+      >
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-7 px-4 pb-10 pt-7 sm:px-5 sm:pt-8">
           {isEmpty ? (
             <EmptyState
               onPick={(s) => {
@@ -189,17 +245,27 @@ export function ChatView({ conversation }: ChatViewProps) {
 
           <ActivityTimeline activities={activities} />
 
-          <div ref={bottomRef} />
         </div>
       </div>
 
+      {!followingLatest && !isEmpty ? (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          className="focus-ring absolute bottom-28 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border-strong)] bg-[var(--bg-elev)]/95 px-3 py-2 text-xs font-medium text-[var(--fg-muted)] shadow-[var(--shadow-md)] backdrop-blur hover:text-[var(--fg)]"
+        >
+          <ArrowDown className="h-3.5 w-3.5" />
+          回到最新
+        </button>
+      ) : null}
+
       {/* Composer */}
-      <div className="border-t border-[var(--border)] bg-[var(--bg)]/60 px-5 py-4 backdrop-blur">
+      <div className="composer-shell border-t border-[var(--border)] bg-[var(--bg)]/72 px-3 py-3 backdrop-blur sm:px-5 sm:py-4">
         <div className="mx-auto w-full max-w-3xl">
           <ChatComposer
             value={input}
             onChange={setInput}
-            onSubmit={() => handleSend()}
+            onSubmit={handleSend}
             onStop={stop}
             status={status}
             searchMode={searchMode}
@@ -226,7 +292,7 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
         直接输入问题，或从下面选择一个起点。模型可以随时在顶部切换。
       </p>
 
-      <div className="mt-10 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
+      <div className="mt-8 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:mt-10 sm:grid-cols-2">
         {SUGGESTIONS.map(({ icon: Icon, title, prompt }) => (
           <button
             key={title}

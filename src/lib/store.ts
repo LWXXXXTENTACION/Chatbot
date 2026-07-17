@@ -252,20 +252,22 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   // ---- Local state updates (used by ChatView for streaming sync) ----
 
   setMessages: (id, messages) =>
-    set((s) => ({
-      conversations: s.conversations.map((c) =>
-        c.id === id
-          ? {
-              ...c,
-              messages,
-              updatedAt:
-                messages.length === c.messages.length
-                  ? c.updatedAt
-                  : Date.now(),
-            }
-          : c,
-      ),
-    })),
+    set((s) => {
+      const index = s.conversations.findIndex((conversation) => conversation.id === id);
+      if (index < 0 || s.conversations[index].messages === messages) return s;
+
+      const current = s.conversations[index];
+      const conversations = [...s.conversations];
+      conversations[index] = {
+        ...current,
+        messages,
+        updatedAt:
+          messages.length === current.messages.length
+            ? current.updatedAt
+            : Date.now(),
+      };
+      return { conversations };
+    }),
 
   setTitle: (id, title) => {
     // Also update on server

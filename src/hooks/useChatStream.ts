@@ -75,12 +75,20 @@ export function useChatStream({
   const currentTextPartRef = useRef<TextPart | null>(null);
   const currentReasoningPartRef = useRef<ReasoningPart | null>(null);
   const toolCallsRef = useRef<Map<string, ToolPartBase>>(new Map());
+  const renderFrameRef = useRef<number | null>(null);
 
   // Latest messages ref for sendMessage
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
 
+  function cancelScheduledRender() {
+    if (renderFrameRef.current === null) return;
+    cancelAnimationFrame(renderFrameRef.current);
+    renderFrameRef.current = null;
+  }
+
   function resetStreamingState() {
+    cancelScheduledRender();
     streamingMessageRef.current = null;
     currentTextPartRef.current = null;
     currentReasoningPartRef.current = null;
@@ -131,7 +139,7 @@ export function useChatStream({
   // invokes during the render phase — calling set() there triggers
   // a synchronous subscriber update, causing "Cannot update a
   // component while rendering a different component").
-  function syncStreamingMessage() {
+  function commitStreamingMessage() {
     if (!streamingMessageRef.current) return;
 
     const parts: MessagePart[] = [];
@@ -160,7 +168,19 @@ export function useChatStream({
     });
   }
 
+  // SSE may deliver many tiny deltas in one browser frame. Treat React state
+  // as a back buffer and publish at most once per paint, while refs keep the
+  // complete lossless stream for the final synchronous commit.
+  function scheduleStreamingMessage() {
+    if (renderFrameRef.current !== null) return;
+    renderFrameRef.current = requestAnimationFrame(() => {
+      renderFrameRef.current = null;
+      commitStreamingMessage();
+    });
+  }
+
   function finalizeStreamingMessage() {
+    cancelScheduledRender();
     const msg = streamingMessageRef.current;
     if (!msg) return;
 
@@ -219,7 +239,7 @@ export function useChatStream({
             ...currentTextPartRef.current,
             text: currentTextPartRef.current.text + data.delta,
           };
-          syncStreamingMessage();
+          scheduleStreamingMessage();
         }
         break;
       }
@@ -251,7 +271,7 @@ export function useChatStream({
             ...currentReasoningPartRef.current,
             text: currentReasoningPartRef.current.text + data.delta,
           };
-          syncStreamingMessage();
+          scheduleStreamingMessage();
         }
         break;
       }
@@ -277,7 +297,7 @@ export function useChatStream({
             parts: [],
           };
         }
-        syncStreamingMessage();
+        scheduleStreamingMessage();
         break;
       }
       case "tool_call_delta": {
@@ -320,7 +340,7 @@ export function useChatStream({
           }
 
           toolCallsRef.current.set(data.toolCallId, next);
-          syncStreamingMessage();
+          scheduleStreamingMessage();
         }
         break;
       }
@@ -357,7 +377,7 @@ export function useChatStream({
             });
           }
 
-          syncStreamingMessage();
+          scheduleStreamingMessage();
         }
         break;
       }
@@ -371,7 +391,7 @@ export function useChatStream({
             state: data.error ? "output-error" : "output-available",
           });
 
-          syncStreamingMessage();
+          scheduleStreamingMessage();
         }
         break;
       }
@@ -425,7 +445,7 @@ export function useChatStream({
         // The done event's messageId is from the graph runner, not the
         // main-agent node, so it won't match. The current streaming
         // message was already synced during streaming
-        // via syncStreamingMessage — we just need to reset the streaming
+        // via scheduled frame commits — we just need to reset the streaming
         // state so the hook is ready for the next message.
         finalizeStreamingMessage();
         resetStreamingState();

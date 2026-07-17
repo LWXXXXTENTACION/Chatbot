@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { MessageSquarePlus } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Menu, MessageSquarePlus } from "lucide-react";
+import { useShallow } from "zustand/react/shallow";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { ArtifactPanel } from "@/components/ArtifactPanel";
@@ -12,10 +13,15 @@ import { useChatStore } from "@/lib/store";
 const KEEP_ALIVE_MAX = 5;
 
 export default function HomePage() {
-  const conversations = useChatStore((s) => s.conversations);
+  const conversationIds = useChatStore(
+    useShallow((s) => s.conversations.map((conversation) => conversation.id)),
+  );
   const activeId = useChatStore((s) => s.activeId);
   const artifactOpen = useChatStore((s) => s.artifactOpen);
   const streamingIds = useChatStore((s) => s.streamingIds);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const openMobileSidebar = useCallback(() => setMobileSidebarOpen(true), []);
+  const closeMobileSidebar = useCallback(() => setMobileSidebarOpen(false), []);
 
   // Auto-load messages for the active conversation on mount / switch.
   // loadConversations() only fetches the list; individual messages are
@@ -53,44 +59,39 @@ export default function HomePage() {
 
     // Fill remaining slots with most recent conversations
     if (ids.size < KEEP_ALIVE_MAX) {
-      const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
-      for (const c of sorted) {
+      for (const id of conversationIds) {
         if (ids.size >= KEEP_ALIVE_MAX) break;
-        ids.add(c.id);
+        ids.add(id);
       }
     }
 
-    return ids;
-  }, [activeId, streamingIds, conversations]);
-
-  const keepAliveConversations = conversations.filter((c) =>
-    keepAliveIds.has(c.id),
-  );
+    return [...ids];
+  }, [activeId, streamingIds, conversationIds]);
 
   return (
     <AuthGuard>
-      <main className="app-bg flex h-full">
-        <Sidebar />
-        <div className="flex h-full min-w-0 flex-1">
-          {keepAliveConversations.length > 0 ? (
-            keepAliveConversations.map((conv) => {
-              const isActive = conv.id === activeId;
-              return (
-                <div
-                  key={conv.id}
-                  className={
-                    isActive
-                      ? "flex h-full min-w-0 flex-1"
-                      : "hidden"
-                  }
-                  aria-hidden={!isActive}
-                >
-                  <ChatView conversation={conv} />
-                </div>
-              );
-            })
+      <main className="app-bg flex h-full min-h-0 overflow-hidden">
+        {mobileSidebarOpen ? (
+          <button
+            type="button"
+            aria-label="关闭对话列表"
+            onClick={closeMobileSidebar}
+            className="fixed inset-0 z-40 bg-black/25 backdrop-blur-[2px] md:hidden"
+          />
+        ) : null}
+        <Sidebar mobileOpen={mobileSidebarOpen} onClose={closeMobileSidebar} />
+        <div className="flex h-full min-w-0 flex-1 overflow-hidden">
+          {keepAliveIds.length > 0 ? (
+            keepAliveIds.map((conversationId) => (
+              <ConversationViewport
+                key={conversationId}
+                conversationId={conversationId}
+                active={conversationId === activeId}
+                onOpenSidebar={openMobileSidebar}
+              />
+            ))
           ) : (
-            <NoConversationState />
+            <NoConversationState onOpenSidebar={openMobileSidebar} />
           )}
           {artifactOpen ? <ArtifactPanel /> : null}
         </div>
@@ -99,7 +100,32 @@ export default function HomePage() {
   );
 }
 
-function NoConversationState() {
+function ConversationViewport({
+  conversationId,
+  active,
+  onOpenSidebar,
+}: {
+  conversationId: string;
+  active: boolean;
+  onOpenSidebar: () => void;
+}) {
+  const conversation = useChatStore((state) =>
+    state.conversations.find((item) => item.id === conversationId),
+  );
+
+  if (!conversation) return null;
+
+  return (
+    <div
+      className={active ? "flex h-full min-w-0 flex-1" : "hidden"}
+      aria-hidden={!active}
+    >
+      <ChatView conversation={conversation} onOpenSidebar={onOpenSidebar} />
+    </div>
+  );
+}
+
+function NoConversationState({ onOpenSidebar }: { onOpenSidebar: () => void }) {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
 
@@ -112,7 +138,15 @@ function NoConversationState() {
   }
 
   return (
-    <div className="flex h-full flex-1 items-center justify-center px-6">
+    <div className="relative flex h-full flex-1 items-center justify-center px-6">
+      <button
+        type="button"
+        onClick={onOpenSidebar}
+        className="focus-ring absolute left-4 top-4 grid h-9 w-9 place-items-center rounded-xl border border-[var(--border)] bg-[var(--bg-elev)] text-[var(--fg-muted)] shadow-[var(--shadow-sm)] md:hidden"
+        aria-label="打开对话列表"
+      >
+        <Menu className="h-4 w-4" />
+      </button>
       <div className="flex max-w-sm flex-col items-center text-center">
         <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-[var(--border-strong)] bg-[var(--bg-elev)] text-[var(--accent-strong)] shadow-[var(--shadow-sm)]">
           <MessageSquarePlus className="h-5 w-5" />

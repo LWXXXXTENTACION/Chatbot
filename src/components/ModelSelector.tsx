@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Cpu } from "lucide-react";
 import {
   DEEPSEEK_MODELS,
@@ -14,7 +14,7 @@ interface ModelSelectorProps {
   disabled?: boolean;
 }
 
-export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps) {
+function ModelSelectorImpl({ value, onChange, disabled }: ModelSelectorProps) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const current = getModel(value);
@@ -58,7 +58,7 @@ export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps)
       </button>
 
       {open ? (
-        <div className="absolute left-0 top-full z-30 mt-2 w-[320px] origin-top-left animate-in rounded-2xl border border-[var(--border)] bg-[var(--bg-elev)] p-1.5 shadow-[var(--shadow-lg)] fade-in-up">
+        <div className="absolute left-0 top-full z-30 mt-2 w-[min(320px,calc(100vw-2rem))] origin-top-left animate-in rounded-2xl border border-[var(--border)] bg-[var(--bg-elev)] p-1.5 shadow-[var(--shadow-lg)] fade-in-up">
           <div className="px-3 pt-2 pb-1">
             <p className="text-[10.5px] font-medium uppercase tracking-[0.12em] text-[var(--fg-subtle)]">
               选择模型
@@ -119,3 +119,5 @@ export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps)
     </div>
   );
 }
+
+export const ModelSelector = memo(ModelSelectorImpl);

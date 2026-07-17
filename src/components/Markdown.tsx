@@ -129,14 +129,26 @@ function sameSources(a?: Source[], b?: Source[]): boolean {
   );
 }
 
-function MarkdownImpl({ children, sources = [] }: { children: string; sources?: Source[] }) {
+function MarkdownImpl({
+  children,
+  sources = [],
+  streaming = false,
+}: {
+  children: string;
+  sources?: Source[];
+  streaming?: boolean;
+}) {
   const processedText = sources.length ? citationMarkdown(children, sources) : children;
 
   return (
-    <div className="markdown">
+    <div className={`markdown ${streaming ? "markdown-streaming" : ""}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        rehypePlugins={
+          streaming
+            ? []
+            : [[rehypeHighlight, { detect: true, ignoreMissing: true }]]
+        }
         components={{
           pre: Pre,
           a: (props) => {
@@ -162,5 +174,7 @@ function MarkdownImpl({ children, sources = [] }: { children: string; sources?: 
 export const Markdown = memo(
   MarkdownImpl,
   (previous, next) =>
-    previous.children === next.children && sameSources(previous.sources, next.sources),
+    previous.children === next.children &&
+    previous.streaming === next.streaming &&
+    sameSources(previous.sources, next.sources),
 );

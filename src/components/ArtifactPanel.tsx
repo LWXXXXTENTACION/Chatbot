@@ -53,7 +53,7 @@ export function ArtifactPanel() {
         "\n```";
 
   return (
-    <aside className="fade-in-up flex h-full w-[clamp(360px,42vw,640px)] shrink-0 flex-col border-l border-[var(--border)] bg-[var(--bg-elev)]">
+    <aside className="fade-in-up fixed inset-0 z-40 flex h-full w-full shrink-0 flex-col bg-[var(--bg-elev)] md:relative md:inset-auto md:z-auto md:w-[clamp(360px,42vw,640px)] md:border-l md:border-[var(--border)]">
       {/* Header */}
       <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">
         <div className="min-w-0 flex-1">

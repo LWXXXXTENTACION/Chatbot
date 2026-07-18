@@ -13,13 +13,14 @@ export function ArtifactPanel() {
   const [copied, setCopied] = useState(false);
 
   const canPreview = artifact?.kind === "html" || artifact?.kind === "svg";
-  // Streaming HTML changes on nearly every tool-call delta. Mounting it in an
-  // iframe at that point reloads srcDoc repeatedly and causes visible flashing.
-  // Keep showing source while content is incomplete, then mount preview once.
+  // HTML/SVG 在 tool_call_delta 阶段几乎每次都变化。若不断更新 iframe.srcDoc，
+  // iframe 会反复整页加载并闪烁；因此生成中固定显示源码占位，结束后一次性挂载预览。
   const previewReady = canPreview && !artifact?.streaming;
   const effectiveTab = previewReady ? tab : "code";
 
   const previewDoc = useMemo(() => {
+    // secureArtifactPreview 会注入 CSP/安全外壳；iframe 再用 sandbox 隔离工件脚本，
+    // 工件内容始终被视为不可信数据，不能直接进入主应用 DOM。
     if (!artifact || artifact.streaming) return "";
     if (artifact.kind === "svg") {
       return secureArtifactPreview(`<style>

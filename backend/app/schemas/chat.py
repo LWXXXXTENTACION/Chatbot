@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     """
 
     conversation_id: str | None = None
+    stream_id: str | None = Field(default=None, min_length=8, max_length=128)
     new_message: "ChatNewMessage | None" = None
     messages: list[dict] | None = None  # legacy: full history
     model: str | None = None

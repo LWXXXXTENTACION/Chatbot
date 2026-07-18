@@ -1,8 +1,6 @@
 /**
- * Catch-all proxy: forwards all /api/* requests to the Python LangGraph backend.
- *
- * Each request is forwarded to http://127.0.0.1:8000 with the same path and body.
- * Authorization headers are forwarded for authenticated endpoints.
+ * 通用同源代理：除专用聊天 POST 外，其余 /api/* 请求保持路径与查询参数不变。
+ * 登录态只通过 Authorization 透传；前端不直接暴露 Python 服务地址。
  */
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -12,7 +10,7 @@ const BACKEND_BASE =
 
 async function handler(req: Request) {
   const url = new URL(req.url);
-  // Reconstruct the backend URL with the same path + query
+  // 保留 path + query，状态探测和显式停止等子路由才能准确命中后端。
   const backendUrl = `${BACKEND_BASE}${url.pathname}${url.search}`;
 
   const authHeader = req.headers.get("authorization") || "";
@@ -39,6 +37,7 @@ async function handler(req: Request) {
       method: req.method,
       headers,
       body,
+      signal: req.signal,
       // @ts-expect-error — Node.js fetch duplex
       duplex: body ? "half" : undefined,
     });
@@ -51,15 +50,16 @@ async function handler(req: Request) {
     );
   }
 
-  // Forward SSE streams
+  // SSE 仍采用字节透明管道，不在 Next.js 中调用 response.text()。
   const isSse = response.headers.get("content-type")?.includes("text/event-stream");
   if (isSse) {
     return new Response(response.body, {
       status: response.status,
       headers: {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       },
     });
   }

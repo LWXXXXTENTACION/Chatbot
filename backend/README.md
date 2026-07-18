@@ -1,248 +1,211 @@
-# DeepSeek Chatbot — LangGraph Python Backend
+# LangGraph 全栈教程 Chatbot · Python 后端
 
-Python backend for the DeepSeek Chatbot, using LangGraph for agent orchestration.
+后端由 FastAPI、LangGraph、SQLAlchemy Async 和 POST SSE 组成。本文从“代码应该从哪里开始读”的角度解释模块边界；完整产品介绍与前端数据流见根目录 [README](../README.md)。
 
-## Quick Start
+## 快速启动
 
 ```bash
 cd backend
-pip install -e .
-uvicorn app.main:app --reload --port 8000
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+cp ../.env.example .env
+.venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
-Or from the project root:
+也可以在项目根目录同时启动前后端：
 
 ```bash
-npm run backend
-# or to start both frontend + backend:
 npm run dev:all
 ```
 
-## Configuration
+Redis 是可选依赖。未启用时，工具缓存退化为 miss，限流退化为当前进程内实现；聊天、LangGraph 和 SQLite 不受影响。
 
-Configure the backend environment:
+## 代码入口
 
-```
-DEEPSEEK_API_KEY=sk-...
-DEEPSEEK_INSECURE_TLS=1  # Enable if behind local TLS proxy (ClashX/Surge)
-DATABASE_URL=sqlite+aiosqlite:///./chatbot.db
-CHECKPOINT_DB_PATH=./checkpoints.db
-REDIS_URL=redis://localhost:6379/0
-REDIS_ENABLED=1
-AUTO_MIGRATE=1
-CONTEXT_MAX_INPUT_TOKENS=32000
-CONTEXT_MICROCOMPACT_TTL_SECONDS=1800
-CONTEXT_SESSION_MEMORY_RATIO=0.45
-CONTEXT_COLLAPSE_RATIO=0.62
-CONTEXT_FULL_COMPACT_RATIO=0.82
-CONTEXT_PTL_TRUNCATION_RATIO=0.95
-CONTEXT_KEEP_RECENT_TURNS=2
-```
+| 文件 | 职责 |
+|---|---|
+| `app/main.py` | 创建 FastAPI 生命周期资源：迁移、checkpointer、Graph、Redis、SSE Registry |
+| `app/routers/chat.py` | 鉴权后的聊天入口、业务历史同步、Graph 运行和消息持久化 |
+| `app/graph/builder.py` | 只组装 Supervisor 父图 |
+| `app/graph/state.py` | Graph 输入、共享 State、输出和 TypedDict |
+| `app/agents/general.py` | General 子图和有界工具循环 |
+| `app/agents/artifact.py` | Artifact 计划、生成、tool-call 构造和结果汇总节点 |
+| `app/agents/research.py` | Research 子图 |
+| `app/graph/deep_search.py` | 无状态 Deep Search DAG |
+| `app/graph/tool_execution.py` | 工具白名单、Schema、额度、缓存、并发、超时和输出裁剪 |
+| `app/graph/events.py` | 后端 SSE 事件类型和唯一发送入口 |
+| `app/streaming.py` | 可续传 SSE 事件日志和订阅管理 |
 
-`chatbot.db` is the business source of truth for users, conversations, and UI
-messages. `checkpoints.db` stores LangGraph thread state and can be rebuilt from
-the business database. Both files are local runtime state and are ignored by
-Git.
+## 严格 LangGraph 工作流
 
-Start the optional Redis cache locally from the repository root:
-
-```bash
-docker compose up -d redis
-```
-
-If Redis is unavailable, tool caching becomes a miss and rate limiting falls
-back to the current process; chat remains available. Exact cache TTLs are 60s
-for weather, 10m for deep search, and 24h for calculations. Artifact creation
-is never cached.
-
-SQLite migrations run automatically by default. They can also be applied
-explicitly before startup:
-
-```bash
-cd backend
-python -m app.database.migrate
-```
-
-Set `AUTO_MIGRATE=0` only when migrations are managed separately.
-
-## Architecture
-
-The backend has one authenticated chat entry point: `POST /api/chat/stream`.
-`main.py` only owns application resources and router registration; request
-validation, persistence, workflow execution, model streaming, and tool
-execution are separate modules.
-
-The main graph implements a Supervisor pattern with two specialized workers:
+父图只做一轮任务的准备、分派和整合：
 
 ```text
 START
-  │
-  ▼
-prepare_turn  reset turn-local coordination state
-  │
-  ▼
-context_manager  evaluate pressure and compact durable working context
-  │
-  ▼
-supervisor    analyze, decompose, and assign one worker
-  │
-  ├── general_agent ─── weather / calculate / artifact tools
-  │
-  └── research_agent ── web_search / deep_search only
-              │
-              ▼
-supervisor_finalize  integrate the worker result
-              │
-              ▼
-             END
+  → prepare_turn
+  → context_manager
+  → supervisor
+      ├→ general_agent（编译子图）
+      └→ research_agent（编译子图）
+  → supervisor_finalize
+  → END
 ```
 
-The Supervisor returns an auditable assignment with `route`, `task`, and
-`reason`. Explicit `web` and `deep` modes deterministically select the Research
-Agent; automatic mode uses the Supervisor model with a deterministic fallback
-when its JSON cannot be parsed.
+Supervisor 返回可审计的：
 
-The General Agent is an isolated, bounded tool-using subgraph:
+```json
+{"route":"general_agent|research_agent","task":"完整任务","reason":"分派理由"}
+```
+
+显式 `web/deep` 模式直接选择 Research；自动模式使用 Supervisor 模型，JSON 无法解析时再走确定性关键词回退。只有 `supervisor_finalize` 会向用户流式输出最终正文，Worker 中间文本不会形成多个互相竞争的回答。
+
+### General 子图
 
 ```text
-START → prepare → agent ── no tool calls ───────────────→ END
-                    │
-                    └── tool calls → tools → agent
-                                      (maximum 3 rounds)
+prepare_general
+  ├→ general_model → general_tools → general_model（最多 3 轮）
+  │                    └→ general_tool_limit
+  └→ prepare_artifact
+       → generate_artifact
+       → build_artifact_call
+       → artifact_tools
+       → finalize_artifact
+  → complete_general
+  → END
 ```
 
-It can use weather, calculation, and artifact tools, but it cannot call any
-search tool. Its intermediate prose stays internal; its tool-call and tool-
-result messages are returned to the main graph so the live UI, checkpoint, and
-business database contain the same trace.
+普通分支让支持 function calling 的模型选择天气、计算等工具。每次工具执行后检查轮数，因此达到上限时不会再产生一个缺少对应 `ToolMessage` 的新调用。
 
-The Research Agent exclusively owns `web_search` and `deep_search`. Fast mode
-runs one web query. Deep/automatic research invokes the inspectable DAG below:
+Artifact 分支是确定性 DAG：模型只生成正文，Graph 再构造标准 `AIMessage.tool_calls`，工具节点执行 `create_artifact`，最后从 `ToolMessage` 判断成功或失败。这样 DeepSeek Reasoner 即使不能绑定工具，也不会因强制 `tool_choice` 报错。
 
-Deep search is also an inspectable LangGraph DAG rather than an opaque helper:
+### Research 子图
+
+```text
+prepare_research
+  → build_research_call
+  → research_tools
+  → finalize_research
+  → END
+```
+
+Research 独占 `web_search` 和 `deep_search`。Web Search 执行一次快速查询；Deep Search 调用独立子图：
 
 ```text
 START → plan_queries → search_sources → synthesize_brief → END
-              (1-3)       (parallel, max 8 sources)
+              1-3 个       并行检索、最多 8 个来源
 ```
 
-It is compiled with `checkpointer=False` because it is a stateless per-turn
-sub-workflow with no interrupts or cross-turn memory.
+Deep Search 是无状态工具工作流，因此明确使用 `checkpointer=False`。General/Research 则使用默认子图作用域，继承父图当前 invocation 的 checkpoint，不创建独立 saver。
 
-Both worker subgraphs are compiled with `checkpointer=False`. They are bounded
-per-turn workspaces with no interrupts or cross-turn memory; the parent
-Supervisor graph owns conversation persistence.
+## State、Runtime 与 Checkpointer
 
-### State and runtime boundaries
-
-`AgentInput` contains API-owned values: messages, model, system prompt, user,
-and conversation IDs. `AgentState` adds explicit coordination fields:
+`AgentInput` 是 API 传入 Graph 的最小输入：
 
 ```text
-supervisor_decision  {route, task, reason}
-active_agent         supervisor | general_agent | research_agent
-completed_agents     ordered list of completed agents
-worker_result        internal result passed back to the Supervisor
-source_citations     normalized search sources
-context_summary      rolling summary of collapsed early turns
-session_memory       thread-scoped memory document with durable facts
-session_memory_cursor last message extracted into session memory
-context_report       applied strategies, token estimates, and overflow flag
-error                workflow failure, if any
+messages / model_id / system_prompt / user_id / conversation_id
 ```
 
-`AgentOutput` exposes only messages and the error consumed by the API. The
-`messages` field uses LangGraph's `add_messages` reducer; coordination fields
-use replacement semantics and are reset by `prepare_turn` after checkpoint
-restoration.
+`AgentState` 再增加三类数据：
 
-Authenticated conversations compile the main graph once with
-`AsyncSqliteSaver`. The conversation ID is the LangGraph `thread_id`.
-`prepare_turn` clears turn-local fields after checkpoint restoration. Search
-mode and cache clients are request-scoped `AgentRuntimeContext` dependencies
-and are never serialized into checkpoints. Streaming is graph-native: nodes
-receive LangGraph's injected `StreamWriter` and publish typed `custom` events.
+```text
+分派状态：supervisor_decision / active_agent / completed_agents / worker_result
+上下文状态：context_summary / session_memory / context_report / source_citations
+子图状态：general_task_route / tool_rounds / artifact_plan / research_plan
+```
 
-Before the Supervisor runs, `context_manager` applies five ordered pressure
-strategies. Ratios are measured against `CONTEXT_MAX_INPUT_TOKENS`:
+关键边界：
 
-| Strategy | Default trigger | State change |
+- `messages` 使用 `add_messages` reducer，保证同 ID 更新和 AI/Tool 协议合并。
+- 其他字段使用替换语义，每轮由 `prepare_turn` 清空 turn-local 字段。
+- `Runtime[AgentRuntimeContext]` 只放缓存、搜索模式、工具额度等不可 checkpoint 的请求级依赖。
+- 父图使用 `AsyncSqliteSaver`，`conversation_id` 就是 LangGraph `thread_id`。
+- `chatbot.db` 保存用户真正看到的消息；`checkpoints.db` 保存 Agent 工作状态。
+
+当业务历史最后一条消息与 checkpoint 不一致时，API 删除该 thread 的旧 checkpoint，并用业务历史重建。业务库始终是可见消息的事实来源。
+
+## 上下文治理
+
+`context_manager` 在 Supervisor 之前按顺序应用五种策略：
+
+| 策略 | 默认触发 | 作用 |
 |---|---:|---|
-| `microcompact` | tool result older than 30m | replace the result payload with a small marker while preserving the `ToolMessage` ID and call metadata |
-| `session_memory` | 45% | extract durable preferences, project facts, constraints, conventions, and open work into the thread-scoped memory document |
-| `context_collapse` | 62% | summarize the oldest eligible segment and remove that complete segment from checkpoint messages |
-| `full_compact` | 82% | roll all eligible old history into the summary while retaining the configured recent turns verbatim |
-| `ptl_truncation` | 95% after compression | deterministically remove the earliest complete turn until below the guard or only the latest turn remains |
+| `microcompact` | 工具结果超过 30 分钟 | 保留 ToolMessage ID 和协议，只缩小旧 payload |
+| `session_memory` | 45% | 提取用户偏好、项目事实、约束和待办 |
+| `context_collapse` | 62% | 压缩最早的一部分完整 turn |
+| `full_compact` | 82% | 压缩所有可处理旧历史，保留最近 turn |
+| `ptl_truncation` | 95% | 最后保护：按完整 turn 删除最早历史 |
 
-`context collapse`, `session memory`, and `full compact` share a dedicated
-summarizer call. If that call fails or returns malformed JSON, a bounded local
-fallback preserves role-labelled excerpts instead of failing the chat turn.
-The summary and memory document are injected into later model calls as
-historical system context, including the isolated General Agent.
+所有删除都以完整 user turn 为单位，不会把 `AIMessage.tool_calls` 与对应 `ToolMessage` 拆开。摘要模型失败时使用有界本地 fallback，不让压缩失败中断聊天。
 
-The final `build_context_window` step remains as a non-mutating model-input
-safety net. Both persistent removal and transient truncation operate on whole
-user turns, so an AI tool call is never separated from its `ToolMessage`.
-The complete visible conversation remains in `chatbot.db`; only the Agent's
-working history in `checkpoints.db` is compacted. If a checkpoint must be
-rebuilt, the business history is loaded and compacted again.
-
-The Research Agent executes one search assignment per turn. Numbered sources
-are attached by `supervisor_finalize` to the final assistant message and
-streamed in a `sources` event.
-
-### End-to-end data flow
+## 工具执行策略链
 
 ```text
-Browser useChatStream
-  → Next.js /api/chat proxy
-  → FastAPI /api/chat/stream (JWT + rate limit + ownership check)
-  → load business history from chatbot.db
-  → compare history with the conversation checkpoint
-      ├─ synchronized: invoke graph with only the new HumanMessage
-      └─ divergent: delete checkpoint and rebuild from business history
-  → graph.astream(AgentInput, thread_id=conversation_id,
-                  stream_mode=["values", "custom"], version="v2")
-  → prepare_turn clears previous coordination state
-  → context_manager estimates tokens and applies zero or more compression strategies
-      ├─ updates checkpoint messages with same-ID replacements / RemoveMessage
-      ├─ persists rolling context_summary + session_memory in AgentState
-      └─ emits context_status with before/after metrics
-  → Supervisor emits {route, task, reason}
-  → selected Worker runs in its isolated subgraph
-      ├─ General Agent: bounded autonomous tool loop
-      └─ Research Agent: fast search or deep-search DAG
-  → Worker returns result + persistable tool trace to shared state
-  → Supervisor integrates one final user-facing answer
-  → graph nodes publish typed events through LangGraph's custom stream
-  → FastAPI consumes custom events and encodes them as POST SSE
-  → Next.js pipes bytes without transforming them
-  → useChatStream reduces events into UI message parts
-  → completed AI/Tool messages are committed to chatbot.db
+Worker 白名单
+  → Pydantic Schema
+  → 每批 / 每回合额度
+  → 用户确认策略
+  → 精确缓存
+  → 并发安全调度
+  → timeout / cancellation
+  → 模型输出与 UI 输出分别裁剪
+  → ToolMessage + State Patch + tool_result 事件
 ```
 
-The business database is the source of truth for the UI. `checkpoints.db` is
-the durable LangGraph execution state and can be rebuilt when its last message
-ID does not match the business history. Redis is only a tool-result cache and
-rate-limit backend; it is not conversation memory.
+默认边界：
 
-### SSE output contract
+- 每批最多 3 个工具调用。
+- 每回合最多 6 个工具调用。
+- 最大并发 3。
+- `deep_search`、`create_artifact` 每回合最多一次。
+- 同一批最多一个工具修改 Graph State。
+- Artifact 正文最多 100,000 字符。
 
-Graph nodes emit the typed union declared in `app/graph/events.py`:
-`text_start/delta/end`, `reasoning_start/delta/end`,
-`tool_call_start/delta/end`, `tool_result`, `sources`, `activity`, and
-`context_status`. The API runner adds the terminal `done` or `error` event.
-`context_status` contains the exact strategies, before/after token estimates,
-pressure ratios, removed-message count, compacted-tool count, and overflow
-flag. Field names intentionally match `src/lib/types.ts`; the client maps an
-applied strategy chain into the visible Agent workflow timeline.
+## Graph 到浏览器的数据流
 
-## Testing
+```text
+FastAPI 加载业务历史并保存 HumanMessage
+  → graph.astream(..., stream_mode=["values", "custom"], subgraphs=True)
+  → 子图 custom 事件由 LangGraph 自动传播
+  → API 把 custom 写入 ResumableSSEStream
+  → 只把根命名空间 values 当作最终 AgentState
+  → 完整 AIMessage / ToolMessage 保存到 chatbot.db
+  → trace_summary + done 结束流
+```
+
+使用 `subgraphs=True` 后会同时收到父图和子图的 `values`。`chat.py` 必须检查 `ns`，否则可能把子图中间快照误当成最终状态。
+
+## 可续传 SSE
+
+`ResumableSSEStream` 为每个 `stream_id` 维护：
+
+- 严格递增的 event ID。
+- 有上限的内存事件日志。
+- 一个与 HTTP 订阅者解耦的 Graph producer task。
+- 终止标记和完成时间。
+
+断线后客户端携带相同 `stream_id` 与 `Last-Event-ID`。服务端只回放游标之后的事件，不重新运行 Graph。事件窗口已经过期时返回 `STREAM_REPLAY_EXPIRED`；用户主动停止才取消 producer。
+
+Graph 节点事件定义在 `app/graph/events.py`：
+
+```text
+text_start / text_delta / text_end
+reasoning_start / reasoning_delta / reasoning_end
+tool_call_start / tool_call_delta / tool_call_end
+tool_result / sources / activity / context_status
+```
+
+API 层另外发送 `trace_summary` 以及终止事件 `done/error`。字段命名与前端 `src/lib/types.ts` 保持一致。
+
+## 测试
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+cd backend
+.venv/bin/python -m pytest -q
+```
 
-# Run tests
-pytest
+当前测试覆盖 Graph 拓扑、子图 xray、Supervisor 路由、Artifact、工具协议、上下文治理、SQLite checkpoint、租户存储、SSE 续传与可观测性。项目根目录还可以运行：
+
+```bash
+npm run eval:sse
+npm run build
 ```

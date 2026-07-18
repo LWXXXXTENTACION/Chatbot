@@ -1,8 +1,7 @@
-"""Five-layer context-pressure management for the Supervisor workflow.
+"""Supervisor 运行前的五层上下文治理。
 
-The business message database remains the source of truth for what the user
-sees. This module reduces the checkpointed/model-working context while keeping
-recent turns and the AI/tool protocol valid.
+业务消息数据库仍是用户可见历史的事实来源。本模块只压缩 checkpoint / 模型工作
+上下文，并始终按完整 turn 操作，保证最近消息和 AI/Tool 协议不被拆散。
 """
 
 from __future__ import annotations
@@ -35,7 +34,8 @@ from app.config import (
     DeepSeekModelId,
 )
 from app.graph.context_window import estimate_tokens, split_complete_turns
-from app.graph.model import emit, message_text
+from app.graph.events import emit
+from app.graph.model import message_text
 from app.graph.state import AgentState, ContextReport, ContextStrategy
 from app.llm.client import create_deepseek_chat
 
@@ -55,7 +55,7 @@ STRATEGY_ORDER: tuple[ContextStrategy, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class ContextPolicy:
-    """Thresholds are ratios of the configured model-input budget."""
+    """所有阈值都是相对于模型输入预算的压力比例。"""
 
     max_tokens: int = CONTEXT_MAX_INPUT_TOKENS
     microcompact_ttl_seconds: int = CONTEXT_MICROCOMPACT_TTL_SECONDS
@@ -102,7 +102,7 @@ def _microcompact_tools(
     *,
     cutoff: datetime,
 ) -> tuple[list[BaseMessage], dict[str, ToolMessage]]:
-    """Replace expired tool payloads, preserving IDs and protocol metadata."""
+    """缩小过期工具 payload，但保留消息 ID、call ID 和协议元数据。"""
     compacted: dict[str, ToolMessage] = {}
     working: list[BaseMessage] = []
     for message in messages:
@@ -166,7 +166,7 @@ def _fallback_summary(
     existing_summary: str,
     existing_memory: str,
 ) -> tuple[str, str]:
-    """Loss-aware local fallback when the summarizer is unavailable."""
+    """摘要模型不可用时，用有界本地摘录保住关键事实而不是中断请求。"""
     items = []
     for message in messages:
         text = message_text(message).strip()
@@ -212,7 +212,7 @@ async def summarize_context(
     existing_summary: str,
     existing_memory: str,
 ) -> tuple[str, str]:
-    """Produce a rolling summary and a thread-scoped memory document."""
+    """一次调用同时生成滚动摘要和 thread 级记忆文档。"""
     fallback = _fallback_summary(messages, existing_summary, existing_memory)
     source = _render_summary_source(messages)
     if not source:
@@ -277,7 +277,7 @@ async def manage_context(
     policy: ContextPolicy | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Apply the five strategies in order and return one reducer-safe update."""
+    """按固定顺序应用五层策略，最后一次性返回 reducer-safe 更新。"""
     effective_policy = policy or ContextPolicy()
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     original = list(state.get("messages", []))
@@ -349,8 +349,8 @@ async def manage_context(
             working = _remove_messages(working, collapse_targets, removed_ids)
             strategies.append("full_compact" if wants_full else "context_collapse")
 
-    # PTL is the deterministic last-resort guard. It removes complete oldest
-    # turns only, never the current/latest turn and never half of a tool pair.
+    # PTL 是最后一道确定性保护：只删除最早的完整 turn，绝不删除当前 turn，
+    # 也绝不把一次 AI tool_call 和它的 ToolMessage 拆开。
     while (
         _context_tokens(working, summary, memory) / effective_policy.max_tokens
         >= effective_policy.ptl_truncation_ratio
@@ -410,5 +410,5 @@ async def context_manager_node(
     state: AgentState,
     writer: StreamWriter,
 ) -> dict[str, Any]:
-    """LangGraph adapter using environment-configured context policy."""
+    """LangGraph 节点适配器：策略阈值来自环境配置。"""
     return await manage_context(state, writer=writer)

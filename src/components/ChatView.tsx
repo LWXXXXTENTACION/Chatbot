@@ -67,6 +67,9 @@ export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
       initialMessages: conversation.messages,
     });
 
+  // useChatStream 独占高频网络/缓冲状态；ChatView 只接收合帧后的消息快照。
+  // 再把快照同步进全局 Store，确保切换对话时可立即恢复，但不会按 token 更新全局树。
+
   // Ref to always have the latest messages, used in cleanup
   const messagesSnapRef = useRef(messages);
   messagesSnapRef.current = messages;
@@ -80,8 +83,7 @@ export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
     setFollowingLatest(true);
   }, [conversation.id]);
 
-  // Persist latest messages to store on unmount so no data is lost
-  // when switching conversations mid-stream.
+  // 切换对话时保存最后快照。cleanup 读取 ref，避免 effect 因每帧 messages 变化重建。
   useEffect(() => {
     return () => {
       setStoreMessages(conversation.id, messagesSnapRef.current);
@@ -108,10 +110,11 @@ export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
   }, [messages, conversation.id, conversation.title, setStoreTitle]);
 
   const isEmpty = messages.length === 0;
-  // Show "busy" when either hook is streaming or store says this conversation is streaming
+  // Hook 反映当前组件；Store 覆盖组件刚卸载/重挂载的过渡期，二者任一忙即锁定输入。
   const busy = status === "streaming" || status === "submitted" || isStoreStreaming;
 
   useEffect(() => {
+    // 自动跟随也按动画帧合并，避免 token 到达时反复触发布局和同步滚动。
     if (!followingLatest) return;
     if (scrollFrameRef.current !== null) {
       cancelAnimationFrame(scrollFrameRef.current);
@@ -155,9 +158,7 @@ export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
 
   const handleModelChange = useCallback((next: DeepSeekModelId) => {
     setModel(next);
-    if (!modelSupportsTools(next)) {
-      setSearchMode("auto");
-    }
+    if (!modelSupportsTools(next)) setSearchMode("auto");
     setStoreModel(conversation.id, next);
   }, [conversation.id, setStoreModel]);
 
@@ -270,7 +271,7 @@ export function ChatView({ conversation, onOpenSidebar }: ChatViewProps) {
             status={status}
             searchMode={searchMode}
             onSearchModeChange={setSearchMode}
-            searchDisabled={!modelSupportsTools(model)}
+            searchAvailable={modelSupportsTools(model)}
           />
         </div>
       </div>

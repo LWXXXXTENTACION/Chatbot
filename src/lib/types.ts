@@ -107,6 +107,7 @@ export interface Activity {
 /** Client → Server: send a chat request (POST body). */
 export interface ChatSendRequest {
   conversation_id: string | null;
+  stream_id: string;
   new_message: {
     role: string;
     content: string;

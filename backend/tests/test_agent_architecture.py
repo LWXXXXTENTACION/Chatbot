@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 
-from app.agents import general, research, supervisor
+from app.agents import artifact, general, research, supervisor
 from app.cache import CacheLookup
 from app.graph import deep_search, model as graph_model, nodes, tool_execution
 from app.graph.builder import build_graph
@@ -40,6 +40,11 @@ def base_state(**overrides):
         "session_memory": "",
         "session_memory_cursor": "",
         "context_report": None,
+        "general_task_route": None,
+        "tool_rounds": 0,
+        "artifact_plan": None,
+        "artifact_content": "",
+        "research_plan": None,
         "error": None,
     }
     state.update(overrides)
@@ -66,11 +71,12 @@ async def collect_graph_stream(graph, input_state, *, context):
         input_state,
         context=context,
         stream_mode=["values", "custom"],
+        subgraphs=True,
         version="v2",
     ):
         if part["type"] == "custom":
             events.append(part["data"])
-        elif part["type"] == "values":
+        elif part["type"] == "values" and not part.get("ns"):
             final_state = part["data"]
     return final_state, events
 
@@ -118,14 +124,55 @@ def test_main_graph_is_a_supervisor_workflow():
     _assert_acyclic(graph)
 
 
-def test_general_agent_has_one_bounded_tool_loop():
+def test_main_graph_xray_expands_compiled_worker_subgraphs():
+    nodes = set(build_graph().get_graph(xray=True).nodes)
+    assert "general_agent:prepare_general" in nodes
+    assert "general_agent:generate_artifact" in nodes
+    assert "general_agent:artifact_tools" in nodes
+    assert "research_agent:prepare_research" in nodes
+    assert "research_agent:research_tools" in nodes
+
+
+def test_general_agent_exposes_standard_and_artifact_workflows():
     graph = general.GENERAL_AGENT_GRAPH.get_graph()
     assert set(graph.nodes) == {
-        "__start__", "prepare", "agent", "tools", "tool_limit", "__end__"
+        "__start__",
+        "prepare_general",
+        "general_model",
+        "general_tools",
+        "general_tool_limit",
+        "prepare_artifact",
+        "generate_artifact",
+        "build_artifact_call",
+        "artifact_tools",
+        "finalize_artifact",
+        "complete_general",
+        "__end__",
     }
     edges = {(edge.source, edge.target) for edge in graph.edges}
-    assert ("tools", "agent") in edges
+    assert ("prepare_general", "general_model") in edges
+    assert ("prepare_general", "prepare_artifact") in edges
+    assert ("general_tools", "general_model") in edges
+    assert ("prepare_artifact", "generate_artifact") in edges
+    assert ("build_artifact_call", "artifact_tools") in edges
+    assert ("artifact_tools", "finalize_artifact") in edges
     assert general.MAX_TOOL_ROUNDS == 3
+
+
+def test_research_agent_is_an_explicit_four_node_workflow():
+    graph = research.RESEARCH_AGENT_GRAPH.get_graph()
+    assert set(graph.nodes) == {
+        "__start__",
+        "prepare_research",
+        "build_research_call",
+        "research_tools",
+        "finalize_research",
+        "__end__",
+    }
+    edges = {(edge.source, edge.target) for edge in graph.edges}
+    assert ("prepare_research", "build_research_call") in edges
+    assert ("build_research_call", "research_tools") in edges
+    assert ("research_tools", "finalize_research") in edges
 
 
 def test_deep_search_is_an_inspectable_acyclic_workflow():
@@ -149,6 +196,7 @@ def test_backend_exposes_only_the_authenticated_chat_transport():
         for method in getattr(route, "methods", set())
     }
     assert ("/api/chat/stream", "POST") in routes
+    assert ("/api/chat/stream/{stream_id}", "DELETE") in routes
     assert not any(path in {"/chat/stream", "/ws"} for path, _method in routes)
 
 
@@ -166,17 +214,24 @@ def test_api_consumes_langgraph_custom_stream_without_runtime_callback():
             config,
             context,
             stream_mode,
+            subgraphs,
             version,
         ):
             assert initial_state["messages"] == [human]
             assert config["configurable"]["thread_id"] == "conversation"
             assert not hasattr(context, "stream_callback")
             assert stream_mode == ["values", "custom"]
+            assert subgraphs is True
             assert version == "v2"
             yield {
                 "type": "custom",
-                "ns": (),
+                "ns": ("general_agent:child",),
                 "data": {"type": "text_delta", "messageId": "answer-1", "delta": "world"},
+            }
+            yield {
+                "type": "values",
+                "ns": ("general_agent:child",),
+                "data": {"messages": [human], "error": "nested state is not final"},
             }
             yield {
                 "type": "values",
@@ -229,6 +284,11 @@ def test_prepare_turn_resets_all_coordination_state():
         "worker_result": "",
         "source_citations": [],
         "context_report": None,
+        "general_task_route": None,
+        "tool_rounds": 0,
+        "artifact_plan": None,
+        "artifact_content": "",
+        "research_plan": None,
         "error": None,
     }
 
@@ -244,7 +304,10 @@ def test_explicit_search_mode_is_assigned_to_research_without_router_llm(
         lambda *_args, **_kwargs: pytest.fail("explicit search must route deterministically"),
     )
     result = asyncio.run(supervisor.supervisor_node(
-        base_state(messages=[HumanMessage(content="research this")]),
+        base_state(
+            model_id="deepseek-reasoner",
+            messages=[HumanMessage(content="research this")],
+        ),
         runtime(search_mode=search_mode),
         noop_writer,
     ))
@@ -305,6 +368,123 @@ def test_tool_ownership_is_separated_between_workers():
     assert [tool.name for tool in RESEARCH_AGENT_TOOLS] == ["web_search", "deep_search"]
 
 
+def test_artifact_prompt_requires_a4_html_for_pdf_preview():
+    assert "PDF 预览" in artifact.ARTIFACT_GENERATION_PROMPT
+    assert "@page" in artifact.ARTIFACT_GENERATION_PROMPT
+    assert "完整正文" in artifact.ARTIFACT_GENERATION_PROMPT
+
+
+def test_reasoner_artifact_workflow_wraps_document_without_forced_tool_choice(
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_stream_model_message(state, **kwargs):
+        captured["model_id"] = state["model_id"]
+        captured["tools"] = kwargs["tools"]
+        captured["strip_tool_protocol"] = kwargs["strip_tool_protocol"]
+        captured["has_tool_choice"] = "tool_choice" in kwargs
+        return AIMessage(content=(
+            "```html\n<!DOCTYPE html><html><body><h1>PDF 预览</h1></body></html>\n```"
+        ))
+
+    monkeypatch.setattr(artifact, "stream_model_message", fake_stream_model_message)
+    result, events = asyncio.run(collect_graph_stream(
+        general.GENERAL_AGENT_GRAPH,
+        base_state(
+            model_id="deepseek-reasoner",
+            messages=[HumanMessage(content="生成 PDF")],
+            supervisor_decision={
+                "route": "general_agent",
+                "task": "生成 PDF",
+                "reason": "artifact",
+            },
+        ),
+        context=runtime().context,
+    ))
+
+    assert captured == {
+        "model_id": "deepseek-reasoner",
+        "tools": None,
+        "strip_tool_protocol": True,
+        "has_tool_choice": False,
+    }
+    assert result["worker_result"] == "文档工件已创建并已在侧边栏打开。"
+    message = result["messages"][-2]
+    assert message.tool_calls[0]["name"] == "create_artifact"
+    assert message.tool_calls[0]["args"]["kind"] == "html"
+    assert message.tool_calls[0]["args"]["content"].startswith("<!DOCTYPE html>")
+    tool_events = [event for event in events if event["type"].startswith("tool_call_")]
+    assert [event["type"] for event in tool_events] == [
+        "tool_call_start",
+        "tool_call_delta",
+        "tool_call_end",
+    ]
+    assert json.loads(tool_events[1]["delta"]) == message.tool_calls[0]["args"]
+
+
+def test_artifact_finalize_node_uses_the_tool_result_without_another_model_call():
+    result = artifact.finalize_artifact_node(base_state(
+        messages=[ToolMessage(
+            content='{"ok":true}',
+            tool_call_id="artifact-call",
+            name="create_artifact",
+        )],
+    ))
+    assert result["worker_result"] == "文档工件已创建并已在侧边栏打开。"
+
+
+def test_reasoner_artifact_workflow_executes_once_and_persists_trace(monkeypatch):
+    calls = 0
+
+    async def fake_stream_model_message(_state, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return AIMessage(content=(
+            "<!DOCTYPE html><html><body><article>稳定文档</article></body></html>"
+        ))
+
+    monkeypatch.setattr(artifact, "stream_model_message", fake_stream_model_message)
+    result, events = asyncio.run(collect_graph_stream(
+        general.GENERAL_AGENT_GRAPH,
+        base_state(
+            model_id="deepseek-reasoner",
+            messages=[HumanMessage(content="生成 PDF")],
+            supervisor_decision={
+                "route": "general_agent",
+                "task": "生成 PDF",
+                "reason": "artifact",
+            },
+        ),
+        context=runtime().context,
+    ))
+
+    assert calls == 1
+    assert result["worker_result"] == "文档工件已创建并已在侧边栏打开。"
+    trace = result["messages"][1:]
+    assert [type(message).__name__ for message in trace] == ["AIMessage", "ToolMessage"]
+    assert trace[0].tool_calls[0]["name"] == "create_artifact"
+    assert json.loads(trace[1].content)["ok"] is True
+    assert [event["type"] for event in events if event["type"].startswith("tool_")] == [
+        "tool_call_start",
+        "tool_call_delta",
+        "tool_call_end",
+        "tool_result",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("生成pdf", True),
+        ("创建一个 HTML 页面", True),
+        ("写一篇介绍，直接在聊天回复，不要创建文档", False),
+    ],
+)
+def test_artifact_intent_detection_respects_explicit_chat_only_request(task, expected):
+    assert artifact.artifact_required(task) is expected
+
+
 def test_general_agent_direct_result_is_internal_until_supervisor_finalizes(monkeypatch):
     class FakeGeneral:
         def bind_tools(self, _tools):
@@ -316,16 +496,22 @@ def test_general_agent_direct_result_is_internal_until_supervisor_finalizes(monk
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: FakeGeneral())
     events = []
 
-    result, trace = asyncio.run(general.run_general_agent(
-        task="write",
-        conversation_messages=[HumanMessage(content="write")],
-        model_id="deepseek-v4-flash",
-        system_prompt="",
+    result, events = asyncio.run(collect_graph_stream(
+        general.GENERAL_AGENT_GRAPH,
+        base_state(
+            messages=[HumanMessage(content="write")],
+            supervisor_decision={
+                "route": "general_agent",
+                "task": "write",
+                "reason": "general",
+            },
+        ),
         context=runtime().context,
-        writer=events.append,
     ))
-    assert result == "worker result"
-    assert trace == []
+    assert result["worker_result"] == "worker result"
+    assert len(result["messages"]) == 1
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert result["messages"][0].content == "write"
     assert not any(event["type"].startswith("text_") for event in events)
 
 
@@ -354,18 +540,68 @@ def test_general_agent_can_call_tools_and_persist_the_trace(monkeypatch):
 
     models = iter([ToolDecision(), ToolAnswer()])
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
-    result, trace = asyncio.run(general.run_general_agent(
-        task="calculate 1+1",
-        conversation_messages=[HumanMessage(content="calculate 1+1")],
-        model_id="deepseek-v4-flash",
-        system_prompt="",
+    result = asyncio.run(general.GENERAL_AGENT_GRAPH.ainvoke(
+        base_state(
+            messages=[HumanMessage(content="calculate 1+1")],
+            supervisor_decision={
+                "route": "general_agent",
+                "task": "calculate 1+1",
+                "reason": "math",
+            },
+        ),
         context=runtime().context,
-        writer=noop_writer,
     ))
-    assert result == "calculation result is 2"
+    assert result["worker_result"] == "calculation result is 2"
+    trace = result["messages"][1:]
     assert [type(message).__name__ for message in trace] == ["AIMessage", "ToolMessage"]
     assert trace[0].tool_calls[0]["name"] == "calculate"
     assert json.loads(trace[1].content)["result"] == 2
+
+
+def test_stream_model_message_keeps_late_tool_id_and_replays_early_args(monkeypatch):
+    class LateIdArtifactModel:
+        def bind_tools(self, _tools):
+            return self
+
+        async def astream(self, _messages):
+            yield AIMessageChunk(content="", tool_call_chunks=[{
+                "name": "create_artifact",
+                "args": '{"title":"演示","kind":"html",',
+                "index": 0,
+            }])
+            yield AIMessageChunk(content="", tool_call_chunks=[{
+                "id": "artifact-real-id",
+                "name": None,
+                "args": '"content":"<h1>你好</h1>"}',
+                "index": 0,
+            }])
+
+    monkeypatch.setattr(
+        graph_model,
+        "create_deepseek_chat",
+        lambda _model: LateIdArtifactModel(),
+    )
+    events = []
+    message = asyncio.run(graph_model.stream_model_message(
+        base_state(),
+        writer=events.append,
+        system_prompts=[],
+        tools=GENERAL_AGENT_TOOLS,
+        attach_sources=False,
+        emit_text=False,
+        emit_reasoning=False,
+    ))
+
+    tool_events = [event for event in events if event["type"].startswith("tool_call_")]
+    assert [event["type"] for event in tool_events] == [
+        "tool_call_start",
+        "tool_call_delta",
+        "tool_call_end",
+    ]
+    assert {event["toolCallId"] for event in tool_events} == {"artifact-real-id"}
+    assert json.loads(tool_events[1]["delta"])["content"] == "<h1>你好</h1>"
+    assert message.tool_calls[0]["id"] == "artifact-real-id"
+    assert message.tool_calls[0]["args"]["title"] == "演示"
 
 
 def test_general_agent_rejects_search_tools():
@@ -641,15 +877,19 @@ def test_general_agent_tool_loop_stops_with_only_complete_protocol_pairs(monkeyp
 
     models = iter(RepeatingToolCall(index) for index in range(4))
     monkeypatch.setattr(graph_model, "create_deepseek_chat", lambda _model: next(models))
-    result, trace = asyncio.run(general.run_general_agent(
-        task="keep calculating",
-        conversation_messages=[HumanMessage(content="calculate")],
-        model_id="deepseek-v4-flash",
-        system_prompt="",
+    result = asyncio.run(general.GENERAL_AGENT_GRAPH.ainvoke(
+        base_state(
+            messages=[HumanMessage(content="calculate")],
+            supervisor_decision={
+                "route": "general_agent",
+                "task": "keep calculating",
+                "reason": "loop test",
+            },
+        ),
         context=runtime().context,
-        writer=noop_writer,
     ))
-    assert "3 轮工具调用上限" in result
+    assert "3 轮工具调用上限" in result["worker_result"]
+    trace = result["messages"][1:]
     assert len(trace) == 6
     assert [type(message).__name__ for message in trace] == [
         "AIMessage",
@@ -687,18 +927,17 @@ def test_research_agent_owns_fast_and_deep_search(monkeypatch, search_mode, expe
         }
 
     monkeypatch.setattr(research, "execute_tool_batch", fake_execute)
-    result = asyncio.run(research.research_worker_node(
+    result = asyncio.run(research.RESEARCH_AGENT_GRAPH.ainvoke(
         base_state(supervisor_decision={
             "route": "research_agent",
             "task": "topic",
             "reason": "needs research",
         }),
-        runtime(search_mode=search_mode),
-        noop_writer,
+        context=runtime(search_mode=search_mode).context,
     ))
     assert result["worker_result"] == "research brief [[cite:1]]"
     assert [type(message).__name__ for message in result["messages"]] == [
-        "AIMessage", "ToolMessage"
+        "HumanMessage", "AIMessage", "ToolMessage"
     ]
     assert result["completed_agents"] == ["research_agent"]
 
@@ -741,6 +980,51 @@ def test_supervisor_finalization_streams_one_user_facing_answer(monkeypatch):
         for message in llm.messages
     )
     assert [event["type"] for event in events if event["type"] == "sources"] == ["sources"]
+
+
+def test_reasoner_finalization_strips_tool_protocol_but_keeps_tool_evidence(
+    monkeypatch,
+):
+    class FakeReasonerFinal:
+        async def astream(self, messages):
+            assert not any(isinstance(message, ToolMessage) for message in messages)
+            assert not any(
+                isinstance(message, AIMessage) and message.tool_calls
+                for message in messages
+            )
+            assert any("created" in str(message.content) for message in messages)
+            yield AIMessageChunk(content="artifact ready")
+
+    monkeypatch.setattr(
+        graph_model,
+        "create_deepseek_chat",
+        lambda _model: FakeReasonerFinal(),
+    )
+    result = asyncio.run(supervisor.supervisor_finalize_node(base_state(
+        model_id="deepseek-reasoner",
+        messages=[
+            HumanMessage(content="生成 PDF"),
+            AIMessage(content="", tool_calls=[{
+                "id": "artifact-call",
+                "name": "create_artifact",
+                "args": {"title": "PDF", "kind": "html", "content": "<h1>PDF</h1>"},
+                "type": "tool_call",
+            }]),
+            ToolMessage(
+                content='{"ok":true,"status":"created"}',
+                tool_call_id="artifact-call",
+                name="create_artifact",
+            ),
+        ],
+        supervisor_decision={
+            "route": "general_agent",
+            "task": "生成 PDF",
+            "reason": "artifact",
+        },
+        worker_result="工件已创建",
+    ), noop_writer))
+
+    assert result["messages"][0].content == "artifact ready"
 
 
 def test_full_supervisor_general_path(monkeypatch):
@@ -873,42 +1157,25 @@ def test_deep_search_query_and_source_bounds():
     ]}])[0]["title"] == "A"
 
 
-def test_deep_search_subgraph_forwards_custom_events(monkeypatch):
+def test_deep_search_runner_invokes_the_compiled_subgraph(monkeypatch):
     class FakeDeepSearchGraph:
-        async def astream(self, _input, *, stream_mode, version):
-            assert stream_mode == ["values", "custom"]
-            assert version == "v2"
-            yield {
-                "type": "custom",
-                "ns": (),
-                "data": {
-                    "type": "activity",
-                    "kind": "searching",
-                    "message": "searching",
-                },
-            }
-            yield {
-                "type": "values",
-                "ns": (),
-                "data": {
-                    "query": "topic",
-                    "queries": ["topic"],
-                    "summary": "brief",
-                    "results": [],
-                },
+        async def ainvoke(self, input_state):
+            assert input_state["query"] == "topic"
+            return {
+                "query": "topic",
+                "queries": ["topic"],
+                "summary": "brief",
+                "results": [],
             }
 
     monkeypatch.setattr(deep_search, "DEEP_SEARCH_GRAPH", FakeDeepSearchGraph())
-    events = []
     result = asyncio.run(deep_search.run_deep_search_workflow(
         query="topic",
         focus="",
         model_id="deepseek-v4-flash",
-        writer=events.append,
     ))
 
     assert result["summary"] == "brief"
-    assert events[0]["type"] == "activity"
 
 
 def test_supervisor_workflow_resumes_messages_by_thread_id(monkeypatch):

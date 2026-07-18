@@ -12,7 +12,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import StreamWriter
 
 from app.config import DeepSeekModelId
-from app.graph.model import emit, message_text
+from app.graph.events import emit
+from app.graph.model import message_text
 from app.graph.state import SourceCitation
 from app.llm.client import create_deepseek_chat
 from app.tools.web_search import web_search
@@ -211,21 +212,11 @@ async def run_deep_search_workflow(
     query: str,
     focus: str,
     model_id: DeepSeekModelId,
-    writer: StreamWriter,
 ) -> dict[str, Any]:
-    """Invoke the inspectable research DAG and expose its stable tool output."""
-    result: dict[str, Any] | None = None
-    async for part in DEEP_SEARCH_GRAPH.astream(
+    """调用 Deep Search 子图；自定义事件由 LangGraph 自动向父图传播。"""
+    result = await DEEP_SEARCH_GRAPH.ainvoke(
         {"query": query, "focus": focus, "model_id": model_id},
-        stream_mode=["values", "custom"],
-        version="v2",
-    ):
-        if part["type"] == "custom":
-            writer(part["data"])
-        elif part["type"] == "values":
-            result = part["data"]
-    if result is None:
-        raise RuntimeError("Deep-search graph completed without a final state")
+    )
     return {
         "query": result["query"],
         "queries": result.get("queries", [query]),

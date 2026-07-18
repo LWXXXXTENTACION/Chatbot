@@ -3,6 +3,7 @@
 import {
   isValidElement,
   memo,
+  useMemo,
   useId,
   type ComponentPropsWithoutRef,
 } from "react";
@@ -12,7 +13,13 @@ import rehypeHighlight from "rehype-highlight";
 import { CodeBlock } from "./CodeBlock";
 import type { Source } from "@/lib/types";
 
-/** Recursively collect raw text from a hast node (for the copy button). */
+/**
+ * Markdown 采用“完成后再解析”策略：流式阶段只显示稳定骨架，不把尚未闭合的
+ * 代码围栏、表格或链接交给解析器；done 后一次性渲染完整 AST，从源头避免布局
+ * 来回跳动和 Markdown 源码短暂裸露。
+ */
+
+/** 递归提取 hast 文本，供代码块复制按钮使用。 */
 function hastToText(node: unknown): string {
   if (!node || typeof node !== "object") return "";
   const n = node as { type?: string; value?: string; children?: unknown[] };
@@ -129,25 +136,23 @@ function sameSources(a?: Source[], b?: Source[]): boolean {
   );
 }
 
-function MarkdownImpl({
-  children,
-  sources = [],
-  streaming = false,
-}: {
-  children: string;
-  sources?: Source[];
-  streaming?: boolean;
-}) {
-  const processedText = sources.length ? citationMarkdown(children, sources) : children;
-
-  return (
-    <div className={`markdown ${streaming ? "markdown-streaming" : ""}`}>
+const MarkdownDocument = memo(
+  function MarkdownDocument({
+    text,
+    sources,
+    highlight,
+  }: {
+    text: string;
+    sources: Source[];
+    highlight: boolean;
+  }) {
+    return (
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={
-          streaming
-            ? []
-            : [[rehypeHighlight, { detect: true, ignoreMissing: true }]]
+          highlight
+            ? [[rehypeHighlight, { detect: true, ignoreMissing: true }]]
+            : []
         }
         components={{
           pre: Pre,
@@ -165,16 +170,67 @@ function MarkdownImpl({
           },
         }}
       >
-        {processedText}
+        {text}
       </ReactMarkdown>
+    );
+  },
+  (previous, next) =>
+    previous.text === next.text
+    && previous.highlight === next.highlight
+    && sameSources(previous.sources, next.sources),
+);
+
+function MarkdownImpl({
+  children,
+  sources = [],
+  streaming = false,
+}: {
+  children: string;
+  sources?: Source[];
+  streaming?: boolean;
+}) {
+  return (
+    <div className={`markdown ${streaming ? "markdown-streaming" : ""}`}>
+      {streaming ? (
+        <StreamingMarkdownPlaceholder />
+      ) : (
+        <CompletedMarkdown text={children} sources={sources} />
+      )}
     </div>
   );
 }
 
+function StreamingMarkdownPlaceholder() {
+  // 固定高度的中性占位不会随半截 Markdown 结构变化，减少消息区重排。
+  return (
+    <div
+      className="space-y-2.5 py-1"
+      data-streaming-markdown-placeholder
+      role="status"
+      aria-label="正在接收完整回复"
+    >
+      <span className="sr-only">正在接收完整回复，完成后显示格式化内容</span>
+      <div className="h-2.5 w-[92%] rounded-full bg-[var(--bg-subtle)]" />
+      <div className="h-2.5 w-[76%] rounded-full bg-[var(--bg-subtle)]" />
+      <div className="h-2.5 w-[58%] rounded-full bg-[var(--bg-subtle)]" />
+    </div>
+  );
+}
+
+function CompletedMarkdown({ text, sources }: { text: string; sources: Source[] }) {
+  const processedText = useMemo(
+    () => sources.length ? citationMarkdown(text, sources) : text,
+    [text, sources],
+  );
+  return <MarkdownDocument text={processedText} sources={sources} highlight />;
+}
+
 export const Markdown = memo(
   MarkdownImpl,
-  (previous, next) =>
-    previous.children === next.children &&
-    previous.streaming === next.streaming &&
-    sameSources(previous.sources, next.sources),
+  (previous, next) => {
+    if (previous.streaming && next.streaming) return true;
+    return previous.children === next.children
+      && previous.streaming === next.streaming
+      && sameSources(previous.sources, next.sources);
+  },
 );

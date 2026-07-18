@@ -1,6 +1,8 @@
-"""
-Chat streaming router with authentication.
-Uses LangGraph for agent orchestration, streams results via SSE.
+"""聊天 API：把数据库、LangGraph 和可续传 SSE 串成一条清晰的数据链。
+
+调用顺序是：鉴权与参数校验 → 加载历史 → 执行父 Graph → 转发 custom 事件
+→ 保存新增消息/运行轨迹 → 发布 done。路由只负责边界编排，Agent 的任务划分、
+工具循环和 Artifact 工作流都在 ``app.graph`` / ``app.agents`` 中声明。
 """
 
 import asyncio
@@ -39,7 +41,7 @@ from app.middleware.auth import get_current_user
 from app.middleware.rate_limit import check_rate_limit
 from app.observability import TraceCollector, bind_trace
 from app.schemas.chat import ChatRequest
-from app.streaming import stream_sse_events
+from app.streaming import ResumableSSEStream, SSEStreamRegistry
 
 logger = logging.getLogger("chatbot.chat")
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -80,7 +82,12 @@ async def _run_graph_and_stream(
     tool_cache: Any | None,
     search_mode: SearchMode,
 ) -> list[BaseMessage]:
-    """Run one graph turn and return messages created after the new user input."""
+    """执行一次标准 LangGraph 流，并返回本轮新产生的消息。
+
+    ``values`` 用于取得最终状态，``custom`` 是面向 UI 的稳定事件协议。
+    开启 ``subgraphs=True`` 后子图也会产生 values 快照，因此这里只接受根命名空间，
+    防止把 Worker 子图的局部 State 错当成父图最终 State。
+    """
     initial_state: AgentInput = {
         "messages": input_messages,
         "model_id": model_id,
@@ -100,11 +107,13 @@ async def _run_graph_and_stream(
             search_mode=search_mode,
         ),
         stream_mode=["values", "custom"],
+        subgraphs=True,
         version="v2",
     ):
         if part["type"] == "custom":
             await send_event(part["data"])
-        elif part["type"] == "values":
+        elif part["type"] == "values" and not part.get("ns"):
+            # 开启 subgraphs 后也会收到子图快照；最终状态只取父图根命名空间。
             final_state = part["data"]
     if final_state is None:
         raise RuntimeError("LangGraph completed without a final state")
@@ -122,6 +131,43 @@ async def _run_graph_and_stream(
 # ——— SSE Endpoint ———
 
 
+@router.delete("/stream/{stream_id}")
+async def cancel_chat_stream(
+    stream_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel an explicit user stop without treating transport loss as a stop."""
+    registry: SSEStreamRegistry = request.app.state.stream_registry
+    stream = registry.get(stream_id, str(current_user.id))
+    if stream is None:
+        return Response(status_code=404)
+    await stream.cancel()
+    await stream.publish({
+        "type": "error",
+        "message": "生成已停止",
+        "code": "CLIENT_CANCELLED",
+    })
+    return Response(status_code=204)
+
+
+@router.get("/stream/{stream_id}/status")
+async def chat_stream_status(
+    stream_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """无副作用地探测流是否仍存在，供“尚未收到首事件”的刷新场景使用。
+
+    此时 Last-Event-ID 还是 0；若后端已经重启，浏览器盲目重发 POST 会创建重复任务。
+    所以前端先探测：204 表示可继续订阅，404 表示放弃本地会话且绝不重跑。
+    """
+    registry: SSEStreamRegistry = request.app.state.stream_registry
+    if registry.get(stream_id, str(current_user.id)) is None:
+        return Response(status_code=404)
+    return Response(status_code=204)
+
+
 @router.post("/stream")
 async def chat_stream(
     request: Request,
@@ -130,10 +176,42 @@ async def chat_stream(
     db: AsyncSession = Depends(get_db),
     _ratelimit: None = Depends(check_rate_limit),
 ):
-    """Authenticated SSE chat streaming endpoint.
+    """创建或续订一个经过鉴权的 SSE 聊天流。"""
+    stream_id = body.stream_id or uuid.uuid4().hex
+    last_event_id_raw = request.headers.get("last-event-id", "").strip()
+    if last_event_id_raw and not last_event_id_raw.isdecimal():
+        return Response(
+            content=json.dumps({"error": "Last-Event-ID 必须是非负整数"}),
+            status_code=400,
+            media_type="application/json",
+        )
+    last_event_id = int(last_event_id_raw or "0")
+    registry: SSEStreamRegistry = request.app.state.stream_registry
+    existing_stream = registry.get(stream_id, str(current_user.id))
+    if existing_stream is not None:
+        # 相同 stream_id 永远只订阅已有日志，不会再次执行 Graph。
+        return StreamingResponse(
+            existing_stream.subscribe(last_event_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "X-Stream-ID": stream_id,
+            },
+        )
+    if registry.has(stream_id):
+        return Response(
+            content=json.dumps({"error": "流不存在"}),
+            status_code=404,
+            media_type="application/json",
+        )
+    if last_event_id > 0:
+        return Response(
+            content=json.dumps({"error": "续传流已过期", "code": "STREAM_NOT_FOUND"}),
+            status_code=409,
+            media_type="application/json",
+        )
 
-    Supports conversation_id mode (recommended) and legacy messages mode.
-    """
     if not DEEPSEEK_API_KEY:
         return Response(
             content=json.dumps({"error": "未配置 DEEPSEEK_API_KEY"}),
@@ -150,7 +228,7 @@ async def chat_stream(
     graph = build_graph()
 
     if body.conversation_id and body.new_message:
-        # New mode: load history from DB, append new message
+        # 推荐模式：后端从数据库加载可信历史，再追加本轮用户消息。
         result = await db.execute(
             select(Conversation)
             .options(
@@ -196,6 +274,8 @@ async def chat_stream(
                 and str(history[-1].id or "") == str(checkpoint_messages[-1].id or "")
             )
         )
+        # SQLite 消息记录是持久事实源。如果 checkpoint 与它不一致（例如开发期
+        # 清库、迁移或旧版本 State），删除该线程快照并用完整数据库历史重新播种。
         if snapshot.values and not checkpoint_synced:
             await request.app.state.checkpointer.adelete_thread(conversation_id)
         input_messages = (
@@ -207,7 +287,7 @@ async def chat_stream(
         await persist_user_message(db, conversation_id, new_user_msg)
 
     elif body.messages:
-        # Legacy mode: full history from client
+        # 兼容旧客户端：接收完整 messages；新代码应优先使用 conversation_id。
         input_messages = ui_messages_to_langchain(body.messages)
     else:
         return Response(
@@ -223,12 +303,15 @@ async def chat_stream(
         search_mode=body.search_mode,
     )
 
-    # SSE streaming setup
-    event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    # Graph 生产任务不属于某一条 HTTP 连接。浏览器刷新或切换对话只会断开订阅；
+    # 用同一个 stream_id 重连时从日志补读，不会重新运行 Graph。
+    stream = ResumableSSEStream(stream_id, str(current_user.id))
+    registry.register(stream)
 
     async def send_event(event: dict[str, Any]) -> None:
+        # 所有 Graph custom 事件都经过同一个入口，便于观测与 SSE 序号保持一致。
         collector.observe_event(event)
-        await event_queue.put(event)
+        await stream.publish(event)
 
     checkpointer = getattr(request.app.state, "checkpointer", None)
     tool_cache = getattr(request.app.state, "tool_cache", None)
@@ -251,6 +334,7 @@ async def chat_stream(
             logger.exception("Failed to persist trace %s", trace.get("run_id"))
 
     async def run_and_persist() -> None:
+        """后台生产者：完整执行 Graph，并在终态前完成消息与轨迹持久化。"""
         try:
             with bind_trace(collector):
                 new_messages = await _run_graph_and_stream(
@@ -298,12 +382,14 @@ async def chat_stream(
             })
 
     graph_task = asyncio.create_task(run_and_persist())
+    stream.attach_producer(graph_task)
 
     return StreamingResponse(
-        stream_sse_events(event_queue, graph_task),
+        stream.subscribe(last_event_id),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
+            "X-Stream-ID": stream_id,
         },
     )

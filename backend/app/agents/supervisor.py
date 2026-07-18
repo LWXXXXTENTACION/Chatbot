@@ -1,4 +1,4 @@
-"""Supervisor Agent: assign one worker and integrate its result."""
+"""Supervisor Agent：每回合只分派一个 Worker，并在统一出口整合结果。"""
 
 import asyncio
 import json
@@ -10,9 +10,10 @@ from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 from langgraph.types import StreamWriter
 
-from app.config import DeepSeekModelId
+from app.config import DeepSeekModelId, tools_enabled
 from app.graph.context import AgentRuntimeContext
-from app.graph.model import build_model_messages, emit, message_text, stream_model_message
+from app.graph.events import emit_activity
+from app.graph.model import build_model_messages, message_text, stream_model_message
 from app.graph.state import AgentState, SupervisorDecision, WorkerRoute
 from app.llm.client import create_deepseek_chat
 
@@ -21,7 +22,7 @@ logger = logging.getLogger("chatbot.agents.supervisor")
 SUPERVISOR_PROMPT = """你是多智能体系统的 Supervisor，只负责分析、分解和分派当前用户任务。
 
 可用 Worker：
-- general_agent：普通任务 Agent。可自己调用天气、计算、工件工具；适合知识问答、编程、写作、计算、天气和创建内容。
+- general_agent：普通任务 Agent。可自己调用天气、计算、工件工具；适合知识问答、编程、写作、计算、天气，以及生成/导出网页、HTML、Markdown、SVG、PDF 或其他可交付内容。
 - research_agent：研究 Agent。专门负责需要联网检索、最新资料、新闻、事实核验、来源引用或多角度研究的任务。
 
 只选择一个最适合的 Worker。返回一个 JSON 对象，不要输出其他文字：
@@ -68,7 +69,7 @@ def _fallback_route(request: str) -> WorkerRoute:
 
 
 def _parse_decision(raw: str, request: str) -> SupervisorDecision:
-    """Parse the Supervisor JSON with a deterministic safe fallback."""
+    """解析 Supervisor JSON；格式不合法时用确定性关键词规则安全回退。"""
     match = re.search(r"\{[\s\S]*\}", raw)
     if match:
         try:
@@ -95,14 +96,14 @@ async def supervisor_node(
     runtime: Runtime[AgentRuntimeContext],
     writer: StreamWriter,
 ) -> dict[str, Any]:
-    """Analyze the current request and assign exactly one specialized worker."""
+    """节点：分析当前请求，并且只选择一个职责明确的 Worker。"""
     context = runtime.context
     request = _latest_user_request(state)
-    await emit(writer, {
-        "type": "activity",
-        "kind": "analyzing",
-        "message": "Supervisor 正在分析并分派任务",
-    })
+    await emit_activity(
+        writer,
+        kind="analyzing",
+        message="Supervisor 正在分析并分派任务",
+    )
 
     if context.search_mode in {"web", "deep"}:
         decision: SupervisorDecision = {
@@ -128,11 +129,11 @@ async def supervisor_node(
                 "reason": "Supervisor 调用失败，已按任务特征安全回退",
             }
 
-    await emit(writer, {
-        "type": "activity",
-        "kind": "analyzing",
-        "message": f"Supervisor 已分派给 {decision['route']}：{decision['reason']}",
-    })
+    await emit_activity(
+        writer,
+        kind="analyzing",
+        message=f"Supervisor 已分派给 {decision['route']}：{decision['reason']}",
+    )
     return {
         "supervisor_decision": decision,
         "active_agent": "supervisor",
@@ -143,7 +144,7 @@ async def supervisor_finalize_node(
     state: AgentState,
     writer: StreamWriter,
 ) -> dict[str, Any]:
-    """Integrate the delegated worker result into the user-facing answer."""
+    """节点：把 Worker 结果和来源整合为面向用户的最终回答。"""
     if state.get("error"):
         return {}
     decision = state.get("supervisor_decision")
@@ -153,18 +154,22 @@ async def supervisor_finalize_node(
         f"分派任务：{decision['task'] if decision else _latest_user_request(state)}\n"
         f"Worker 结果：\n{worker_result or 'Worker 未返回文本结果，请根据已有工具消息说明限制。'}"
     )
-    await emit(writer, {
-        "type": "activity",
-        "kind": "answering",
-        "message": "Supervisor 正在整合 Worker 结果",
-    })
+    await emit_activity(
+        writer,
+        kind="answering",
+        message="Supervisor 正在整合 Worker 结果",
+    )
     try:
+        model_id: DeepSeekModelId = state.get("model_id", "deepseek-v4-flash")
         message = await stream_model_message(
             state,
             writer=writer,
             system_prompts=[SUPERVISOR_FINAL_PROMPT, integration_context],
             tools=None,
             attach_sources=True,
+            # Reasoner 不能接收供应商工具协议消息；工具轨迹仍写入 checkpoint/DB，
+            # 最终整合则把 worker_result 当作不可信证据文本传入。
+            strip_tool_protocol=not tools_enabled(model_id),
         )
         completed = list(state.get("completed_agents", []))
         if "supervisor" not in completed:

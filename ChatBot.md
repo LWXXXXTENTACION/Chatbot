@@ -1,25 +1,23 @@
-## DeepSeek Agent Workspace
-
-**角色：全栈开发 / AI Agent 工程**
+# LangGraph 全栈教程 Chatbot
 
 ### 项目背景
 
-面向产品调研、技术研究、计算分析和轻量原型等知识任务，独立开发可执行工具、生成交付物并持续评测优化的 AI Agent 工作台，而非仅提供问答的模型套壳。
+面向刚学习 LangGraph、希望掌握全栈 AI 开发的开发者，构建覆盖 Multi-Agent、工具、Artifact、SSE、持久化与 Evals 的开源教程 Chatbot，并以中文注释和显式 Graph 拓扑降低学习成本。
 
 ### 核心难点
 
-1. 多 Agent 分工、工具调用与最终回复需要保持单一可审计执行链。
-2. 长会话需保留事实与约束，同时控制 Token 和工具调用膨胀。
-3. 模型生成的 HTML/SVG 与工具结果需要安全展示、限额和回放。
+1. Supervisor、General、Research 与 Artifact 需要形成单一、可审计的工作流。
+2. SSE 需同时处理 TCP 拆包、Unicode、逐 token 重渲染、断流续传和重复订阅。
+3. 业务消息、LangGraph checkpoint、工具协议和侧栏 Artifact 需要保持一致。
 
 ### 解决方案
 
-1. 通过 LangGraph Supervisor 编排 General/Research Agent，实现研究、计算、搜索与 Artifact 任务的职责隔离。
-2. 通过五层上下文治理及 ToolPolicy/Registry，实现每批 **3 次**、每回合 **6 次**、并发 **3 次**的资源边界。
-3. 通过 CSP 沙箱、结构化 ToolOutcome 和独立 Eval Lab，实现工件安全预览及 Token、耗时、调用和质量的版本对比。
+1. 通过共享 AgentState、编译子图和显式 Node/Edge，实现任务分派、工具循环、研究及 Artifact DAG。
+2. 通过增量 Parser、Last-Event-ID、事件日志与 rAF 双缓冲，实现无损续传和低频 UI 发布。
+3. 通过 SQLAlchemy、AsyncSqliteSaver、ToolPolicy 与标准 AIMessage/ToolMessage，实现持久化、安全边界和可恢复执行。
 
 ### 项目亮点
 
-- 支持带引用 Deep Search，以及代码、HTML、SVG、Markdown 可预览交付物。
-- 工具结果上限由 **20,046 字符降至 4,000 字符**，后端 **48 项测试通过**。
-- 运行 Trace 与业务消息同步持久化，可按固定 Case 回放每轮 Agent 优化效果。
+- 支持带引用 Deep Search，以及 HTML、SVG、Markdown、代码和 PDF 打印预览 Artifact。
+- 30,000 个 delta 的 UI 发布减少 **98.44%**，当前 **62 项后端测试通过**。
+- 内置独立 Eval Lab，可按版本对比 Token、耗时、工具调用和回答质量。

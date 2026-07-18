@@ -1,4 +1,9 @@
-"""Policy-driven execution for bounded, observable tool-call batches."""
+"""统一工具策略节点的底层实现。
+
+Agent 只负责产生 tool_calls；真正执行前必须经过白名单、Schema、额度、确认、
+缓存、并发与超时检查。模型看到的裁剪结果、UI 看到的展示结果和允许写回 Graph
+的 State Patch 被明确分离，避免工具输出直接任意修改共享状态。
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from pydantic import ValidationError
 from app.config import DeepSeekModelId
 from app.graph.context import AgentRuntimeContext
 from app.graph.deep_search import dedupe_sources, run_deep_search_workflow
-from app.graph.model import emit
+from app.graph.events import emit
 from app.graph.state import AgentState, SourceCitation
 from app.tools.registry import (
     MAX_BATCH_TOOL_CALLS,
@@ -34,7 +39,7 @@ OutcomeStatus = Literal["success", "error", "rejected", "timeout"]
 
 @dataclass(frozen=True)
 class ToolOutcome:
-    """Separate model context, UI output, and controlled graph mutation."""
+    """一次工具结果的三层视图：模型上下文、UI 展示和受控状态更新。"""
 
     model_content: str
     display_output: dict[str, Any]
@@ -51,6 +56,8 @@ class ToolOutcome:
 
 @dataclass(frozen=True)
 class PreparedCall:
+    """通过工具归属与 Pydantic Schema 检查后的不可变调用。"""
+
     index: int
     call_id: str
     name: str
@@ -211,6 +218,7 @@ async def _prepare_calls(
     context: AgentRuntimeContext,
     writer: StreamWriter,
 ) -> tuple[list[PreparedCall], list[tuple[PreparedCall, ToolOutcome]]]:
+    """先同步完成所有廉价检查；被拒绝的调用也会产生配对 ToolMessage。"""
     prepared: list[PreparedCall] = []
     rejected: list[tuple[PreparedCall, ToolOutcome]] = []
     state_patch_reserved = False
@@ -305,6 +313,7 @@ async def _invoke(
     writer: StreamWriter,
     context: AgentRuntimeContext,
 ) -> ToolOutcome:
+    """执行一个已验证调用，并统一处理缓存、超时、裁剪和 State Patch。"""
     policy = call.policy
     started = time.perf_counter()
     cached = False
@@ -326,7 +335,6 @@ async def _invoke(
                             query=str(call.args.get("query", "")).strip(),
                             focus=str(call.args.get("focus", "")).strip(),
                             model_id=model_id,
-                            writer=writer,
                         )
                     else:
                         output = await policy.tool.ainvoke(call.args)
@@ -413,6 +421,7 @@ async def _execute_batch(
     context: AgentRuntimeContext,
     writer: StreamWriter,
 ) -> tuple[list[ToolMessage], dict[str, Any]]:
+    """按策略选择串行或并行执行，最后恢复模型原始调用顺序。"""
     prepared, rejected = await _prepare_calls(
         calls,
         worker=worker,

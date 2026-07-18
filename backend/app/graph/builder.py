@@ -1,9 +1,9 @@
-"""Build the Supervisor multi-agent LangGraph workflow."""
+"""组装 Supervisor 父图，并直接挂载两个编译后的 Worker 子图。"""
 
 from langgraph.graph import END, START, StateGraph
 
-from app.agents.general import general_worker_node
-from app.agents.research import research_worker_node
+from app.agents.general import GENERAL_AGENT_GRAPH
+from app.agents.research import RESEARCH_AGENT_GRAPH
 from app.agents.supervisor import supervisor_finalize_node, supervisor_node
 from app.graph.context import AgentRuntimeContext
 from app.graph.context_manager import context_manager_node
@@ -13,10 +13,13 @@ from app.graph.state import AgentInput, AgentOutput, AgentState
 
 
 def build_graph(*, checkpointer=None):
-    """Compile one Supervisor assignment and integration cycle.
+    """编译一次严格的 Supervisor 分派与整合工作流。
 
     START → prepare_turn → context_manager → supervisor → one worker →
     supervisor_finalize → END
+
+    Worker 使用编译子图直接作为节点。共享 ``AgentState`` 由父图唯一
+    checkpointer 持久化，Runtime 则只向具体节点注入缓存和工具预算。
     """
     graph = StateGraph(
         AgentState,
@@ -27,8 +30,8 @@ def build_graph(*, checkpointer=None):
     graph.add_node("prepare_turn", prepare_turn_node)
     graph.add_node("context_manager", context_manager_node)
     graph.add_node("supervisor", supervisor_node)
-    graph.add_node("general_agent", general_worker_node)
-    graph.add_node("research_agent", research_worker_node)
+    graph.add_node("general_agent", GENERAL_AGENT_GRAPH)
+    graph.add_node("research_agent", RESEARCH_AGENT_GRAPH)
     graph.add_node("supervisor_finalize", supervisor_finalize_node)
 
     graph.add_edge(START, "prepare_turn")

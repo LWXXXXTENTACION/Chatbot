@@ -10,6 +10,7 @@ import {
   Target,
 } from "lucide-react";
 import { ObservabilityDashboard } from "@/components/ObservabilityDashboard";
+import { SSEPerformanceEval } from "@/components/SSEPerformanceEval";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { api } from "@/lib/api";
 import { clearTokens, setTokens } from "@/lib/auth";
@@ -129,6 +130,7 @@ function EvalLogin() {
 
 export function EvaluationLab() {
   const { user, isLoading, isAuthenticated } = useAuth();
+  const [surface, setSurface] = useState<"quality" | "transport">("quality");
 
   async function handleLogout() {
     try {
@@ -174,6 +176,28 @@ export function EvaluationLab() {
           <span className="font-mono text-[10px] font-semibold">DeepSeek Chatbot</span>
         </div>
 
+        <nav className="ml-4 flex items-center rounded-lg bg-[var(--bg-subtle)] p-1 md:ml-8" aria-label="评测模块">
+          {([
+            ["quality", Target, "模型质量"],
+            ["transport", Activity, "SSE 性能"],
+          ] as const).map(([id, Icon, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setSurface(id)}
+              aria-pressed={surface === id}
+              className={`focus-ring flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[10px] font-semibold transition-colors sm:px-3 ${
+                surface === id
+                  ? "bg-[var(--bg-elev)] text-[var(--fg)] shadow-[var(--shadow-sm)]"
+                  : "text-[var(--fg-subtle)] hover:text-[var(--fg)]"
+              }`}
+            >
+              <Icon className="h-3 w-3" />
+              <span className="hidden sm:inline">{label}</span>
+            </button>
+          ))}
+        </nav>
+
         <div className="ml-auto flex items-center gap-2">
           <div className="mr-2 hidden text-right sm:block">
             <p className="text-[10px] font-medium">{user?.username}</p>
@@ -191,7 +215,7 @@ export function EvaluationLab() {
         </div>
       </header>
       <div className="relative z-10 min-h-0 flex-1">
-        <ObservabilityDashboard />
+        {surface === "quality" ? <ObservabilityDashboard /> : <SSEPerformanceEval />}
       </div>
     </main>
   );

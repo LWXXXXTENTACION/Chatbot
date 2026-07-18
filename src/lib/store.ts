@@ -2,8 +2,18 @@ import { create } from "zustand";
 import { DEFAULT_MODEL, type DeepSeekModelId } from "./models";
 import type { Artifact, ChatUIMessage, Conversation, Source } from "./types";
 import { api } from "./api";
+import { latestArtifactFromMessages } from "./artifacts";
 
-// ---- Store Interface ----
+/**
+ * 前端共享状态边界。
+ *
+ * 服务端数据库是对话消息的事实源；Zustand 只保存当前页面需要的缓存、侧边栏状态
+ * 和 AbortController。Artifact 与流状态都按 conversationId 隔离，切换对话时不会
+ * 把上一条流或工件串到新对话。高频 token 不直接写 Store，而由 useChatStream 的
+ * ref + rAF 缓冲合帧后再同步，避免扩大重渲染范围。
+ */
+
+// ---- 状态与动作接口 ----
 
 interface ChatState {
   // Conversation state (transient, API-driven)
@@ -12,7 +22,7 @@ interface ChatState {
   hydrated: boolean;
   isLoading: boolean;
 
-  // Artifact side panel — per-conversation to prevent cross-talk
+  // 每个对话独立保存最新 Artifact；artifactOpen 只控制当前活动侧栏是否可见。
   artifacts: Record<string, Artifact>;
   artifactOpen: boolean;
 
@@ -20,7 +30,7 @@ interface ChatState {
   messageSources: Record<string, Source[]>;
   setMessageSources: (messageId: string, sources: Source[]) => void;
 
-  // Stream tracking (survives component unmount)
+  // 流控制器放在组件外，使切换对话/组件卸载后仍能准确取消旧订阅。
   streamingIds: Set<string>;
   markStreaming: (id: string) => void;
   markStreamDone: (id: string) => void;
@@ -67,7 +77,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     return conversations.find((c) => c.id === activeId) ?? null;
   },
 
-  // ---- API-driven actions ----
+  // ---- 服务端数据动作 ----
 
   loadConversations: async () => {
     // Guard: don't call API without auth token (prevents 401 loops)
@@ -149,11 +159,19 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   },
 
   selectConversation: (id) =>
-    set((s) =>
-      s.conversations.some((c) => c.id === id)
-        ? { activeId: id, artifactOpen: false }
-        : s,
-    ),
+    set((s) => {
+      const conversation = s.conversations.find((c) => c.id === id);
+      if (!conversation) return s;
+      const artifact = s.artifacts[id]
+        ?? latestArtifactFromMessages(conversation.messages);
+      return {
+        activeId: id,
+        artifacts: artifact
+          ? { ...s.artifacts, [id]: artifact }
+          : s.artifacts,
+        artifactOpen: Boolean(artifact),
+      };
+    }),
 
   deleteConversation: async (id) => {
     try {
@@ -211,8 +229,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         createdAt: new Date(m.created_at),
       }));
 
-      // Extract sources persisted directly on each final answer. The tool
-      // fallback keeps older conversations readable.
+      // 新数据直接从最终回答的 sources part 恢复；工具输出分支兼容旧会话格式。
       const sourcesMap: Record<string, Source[]> = {};
       (data.messages || []).forEach((m) => {
         const msgId = messages.find((msg) => msg.id === m.id)?.id;
@@ -232,24 +249,32 @@ export const useChatStore = create<ChatState>()((set, get) => ({
         });
       });
 
-      // Update local conversation with loaded messages.
-      // Only apply if local cache is empty — streaming data is more
-      // up-to-date than DB (which may not have assistant messages persisted yet).
-      set((s) => ({
-        conversations: s.conversations.map((c) =>
-          c.id === id
-            ? (c.messages.length === 0 ? { ...c, messages } : c)
-            : c,
-        ),
-        messageSources: { ...s.messageSources, ...sourcesMap },
-      }));
+      // 只有本地缓存为空才用 DB 覆盖：生成过程中内存比尚未落库的 assistant 消息新。
+      const latestArtifact = latestArtifactFromMessages(messages);
+      set((s) => {
+        const canHydrateArtifact = latestArtifact && !s.streamingIds.has(id);
+        return {
+          conversations: s.conversations.map((c) =>
+            c.id === id
+              ? (c.messages.length === 0 ? { ...c, messages } : c)
+              : c,
+          ),
+          artifacts: canHydrateArtifact
+            ? { ...s.artifacts, [id]: latestArtifact }
+            : s.artifacts,
+          artifactOpen: canHydrateArtifact && s.activeId === id
+            ? true
+            : s.artifactOpen,
+          messageSources: { ...s.messageSources, ...sourcesMap },
+        };
+      });
       return messages;
     } catch {
       return get().conversations.find((c) => c.id === id)?.messages || [];
     }
   },
 
-  // ---- Local state updates (used by ChatView for streaming sync) ----
+  // ---- ChatView 合帧后的本地同步 ----
 
   setMessages: (id, messages) =>
     set((s) => {
@@ -289,7 +314,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     }));
   },
 
-  // ---- Artifact actions ----
+  // ---- Artifact 动作（全部带 conversationId 作用域） ----
 
   openArtifact: (conversationId, artifact) =>
     set((s) => ({
@@ -299,12 +324,11 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   updateArtifact: (conversationId, artifact) =>
     set((s) => {
       const current = s.artifacts[conversationId];
-      // Always update if no current artifact or same artifact
+      // 同一工具调用持续覆盖；新一轮 streaming Artifact 可以替换旧的已完成工件。
       if (!current) return { artifacts: { ...s.artifacts, [conversationId]: artifact } };
       if (current.id === artifact.id) return { artifacts: { ...s.artifacts, [conversationId]: artifact } };
-      // Only allow a NEW STREAMING artifact to replace a completed one.
       if (!current.streaming && artifact.streaming) return { artifacts: { ...s.artifacts, [conversationId]: artifact } };
-      // Current artifact is still streaming -- don't overwrite
+      // 当前仍在流式生成时，迟到的其他旧工具事件不能把它覆盖。
       return s;
     }),
   closeArtifact: () => set({ artifactOpen: false }),
@@ -317,7 +341,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
   clearData: () =>
     set({ conversations: [], activeId: null, artifacts: {}, artifactOpen: false, messageSources: {} }),
 
-  // ---- Stream tracking (survives component unmount) ----
+  // ---- 跨组件生命周期的流状态 ----
 
   streamingIds: new Set<string>(),
 
@@ -332,13 +356,15 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     set((s) => {
       const next = new Set(s.streamingIds);
       next.delete(id);
-      return { streamingIds: next };
+      return {
+        streamingIds: next,
+        _streamAborts: { ...s._streamAborts, [id]: null },
+      };
     }),
 
   isStreaming: (id) => get().streamingIds.has(id),
 
-  // Per-conversation abort controllers so re-entering a conversation
-  // can cancel its old background stream before starting a new one.
+  // 每个对话只有一个订阅者控制器；新控制器注册时会取消旧订阅，防止双重消费。
   _streamAborts: {} as Record<string, AbortController | null>,
   abortStream: (id) => {
     const ctrl = get()._streamAborts[id];
@@ -356,6 +382,10 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     });
   },
   setStreamAbort: (id, ctrl) => {
-    get()._streamAborts[id] = ctrl;
+    const previous = get()._streamAborts[id];
+    if (previous && previous !== ctrl) previous.abort();
+    set((s) => ({
+      _streamAborts: { ...s._streamAborts, [id]: ctrl },
+    }));
   },
 }));

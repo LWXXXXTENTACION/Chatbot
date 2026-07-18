@@ -1,23 +1,37 @@
-"""面向公开、幂等工具的 Redis 精确缓存。
+"""面向公开、幂等工具的 L1/L2/L3 精确缓存。
 
-缓存不是事实来源，只用于避免相同搜索、天气或计算重复执行。Redis 故障时统一
-按 miss 处理（fail-open），不能让可选缓存成为聊天主链的单点故障。
+读取顺序固定为 ``进程内 L1 → Redis L2 → 数据库 L3``。下层命中后会把仍在
+有效期内的值逐级回填到上层；真实工具执行成功后则并行写入三层。任何缓存层
+故障都按 miss/fail-open 处理，不能让可选加速能力成为聊天主链的单点故障。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import math
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.database.models import ToolCacheEntry
 
 logger = logging.getLogger("chatbot.cache")
 
 CACHE_PREFIX = "chatbot:tool"
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"
 REDIS_RETRY_SECONDS = 30.0
+DEFAULT_L1_MAX_ENTRIES = 1024
+L3_IO_TIMEOUT_SECONDS = 1.0
+
+CacheLayer = Literal["l1", "l2", "l3"]
 
 
 @dataclass(frozen=True)
@@ -27,8 +41,19 @@ class CachePolicy:
 
 @dataclass(frozen=True)
 class CacheLookup:
+    """一次缓存查询的结果；``layer`` 用于事件追踪和性能评测。"""
+
     hit: bool
     value: Any = None
+    layer: CacheLayer | None = None
+
+
+@dataclass(frozen=True)
+class _CacheValue:
+    """三层共享的内部值结构，统一使用绝对过期时间避免回填后 TTL 重置。"""
+
+    value: Any
+    expires_at: float
 
 
 CACHE_POLICIES: dict[str, CachePolicy] = {
@@ -94,16 +119,47 @@ def tool_cache_key(
     return f"{CACHE_PREFIX}:{tool_name}:{CACHE_VERSION}:{digest}"
 
 
-class ToolCache:
-    """Redis 精确缓存；连接异常后短暂熔断，期间全部退化为 cache miss。"""
+def _datetime_to_timestamp(value: datetime) -> float:
+    """兼容 SQLite 读回的无时区 datetime，并统一按 UTC 解释。"""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
 
-    def __init__(self, redis_client: Any | None) -> None:
+
+class MultiLayerCache:
+    """L1 内存 + L2 Redis + L3 数据库的读穿透、写穿透缓存。
+
+    L1 使用有界 LRU，防止长进程无限增长；Redis 与数据库都是可选依赖，但生产
+    装配会始终提供数据库层。所有层保存同一个绝对 ``expires_at``，因此从 L3
+    回填到 L2/L1 时只使用剩余 TTL，不会意外延长旧数据寿命。
+    """
+
+    def __init__(
+        self,
+        redis_client: Any | None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        *,
+        l1_max_entries: int = DEFAULT_L1_MAX_ENTRIES,
+    ) -> None:
         self.redis = redis_client
-        self._retry_at = 0.0
+        self.session_factory = session_factory
+        self.l1_max_entries = max(0, l1_max_entries)
+        self._l1: OrderedDict[str, _CacheValue] = OrderedDict()
+        self._l1_lock = asyncio.Lock()
+        self._redis_retry_at = 0.0
 
     @property
     def enabled(self) -> bool:
-        return self.redis is not None
+        return bool(
+            self.l1_max_entries > 0
+            or self.redis is not None
+            or self.session_factory is not None
+        )
+
+    @property
+    def l1_size(self) -> int:
+        """仅供运行观测与 eval 使用；缓存读写仍必须经过锁保护的方法。"""
+        return len(self._l1)
 
     async def get(
         self,
@@ -112,24 +168,34 @@ class ToolCache:
         *,
         model_id: str = "",
     ) -> CacheLookup:
-        if tool_name not in CACHE_POLICIES or not self.enabled:
-            return CacheLookup(hit=False)
-        if time.monotonic() < self._retry_at:
+        policy = CACHE_POLICIES.get(tool_name)
+        if policy is None or not self.enabled:
             return CacheLookup(hit=False)
 
         key = tool_cache_key(tool_name, args, model_id=model_id)
-        try:
-            raw = await self.redis.get(key)
-            if raw is None:
-                return CacheLookup(hit=False)
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            envelope = json.loads(raw)
-            return CacheLookup(hit=True, value=envelope["value"])
-        except Exception as exc:
-            # 读取缓存失败不等于工具失败，后续仍会执行真实工具。
-            self._mark_unavailable(exc)
-            return CacheLookup(hit=False)
+        now = time.time()
+
+        # 1. L1 是当前进程热路径，不发生序列化和网络/磁盘 I/O。
+        cached = await self._get_l1(key, now)
+        if cached is not None:
+            return CacheLookup(hit=True, value=cached.value, layer="l1")
+
+        # 2. L2 允许不同进程共享热结果；命中后立即晋升到 L1。
+        cached = await self._get_l2(key, now)
+        if cached is not None:
+            await self._put_l1(key, cached)
+            return CacheLookup(hit=True, value=cached.value, layer="l2")
+
+        # 3. L3 跨 Redis 重启保留结果；命中后同时回填 L1 与 L2。
+        cached = await self._get_l3(key, now)
+        if cached is not None:
+            await asyncio.gather(
+                self._put_l1(key, cached),
+                self._put_l2(key, cached),
+            )
+            return CacheLookup(hit=True, value=cached.value, layer="l3")
+
+        return CacheLookup(hit=False)
 
     async def put(
         self,
@@ -140,32 +206,171 @@ class ToolCache:
         model_id: str = "",
     ) -> None:
         policy = CACHE_POLICIES.get(tool_name)
-        if policy is None or not self.enabled or time.monotonic() < self._retry_at:
+        if policy is None or not self.enabled:
             return
         if isinstance(value, dict) and value.get("error"):
             # 错误结果不能缓存，否则一次临时故障会在整个 TTL 内持续污染回答。
             return
 
         key = tool_cache_key(tool_name, args, model_id=model_id)
+        cached = _CacheValue(
+            value=value,
+            expires_at=time.time() + policy.ttl_seconds,
+        )
+
+        # L1 先完成，L2/L3 并行写；任一外部层故障都不会抹掉已得到的工具结果。
+        await self._put_l1(key, cached)
+        await asyncio.gather(
+            self._put_l2(key, cached),
+            self._put_l3(key, tool_name, cached),
+        )
+
+    async def clear_l1(self) -> None:
+        """清空当前进程热缓存，主要用于测试重启/跨层回填。"""
+        async with self._l1_lock:
+            self._l1.clear()
+
+    async def _get_l1(self, key: str, now: float) -> _CacheValue | None:
+        if self.l1_max_entries <= 0:
+            return None
+        async with self._l1_lock:
+            cached = self._l1.get(key)
+            if cached is None:
+                return None
+            if cached.expires_at <= now:
+                self._l1.pop(key, None)
+                return None
+            self._l1.move_to_end(key)
+            return cached
+
+    async def _put_l1(self, key: str, cached: _CacheValue) -> None:
+        if self.l1_max_entries <= 0 or cached.expires_at <= time.time():
+            return
+        async with self._l1_lock:
+            self._l1[key] = cached
+            self._l1.move_to_end(key)
+            while len(self._l1) > self.l1_max_entries:
+                self._l1.popitem(last=False)
+
+    async def _get_l2(self, key: str, now: float) -> _CacheValue | None:
+        if self.redis is None or time.monotonic() < self._redis_retry_at:
+            return None
+        try:
+            raw = await self.redis.get(key)
+        except Exception as exc:
+            self._mark_redis_unavailable(exc)
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            envelope = json.loads(raw)
+            if envelope.get("version") != CACHE_VERSION:
+                return None
+            cached = _CacheValue(
+                value=envelope["value"],
+                expires_at=float(envelope["expires_at"]),
+            )
+            return cached if cached.expires_at > now else None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring malformed Redis tool cache entry %s: %s", key, exc)
+            return None
+
+    async def _put_l2(self, key: str, cached: _CacheValue) -> None:
+        if self.redis is None or time.monotonic() < self._redis_retry_at:
+            return
+        remaining_ttl = math.ceil(cached.expires_at - time.time())
+        if remaining_ttl <= 0:
+            return
         envelope = json.dumps(
-            {"version": CACHE_VERSION, "value": value},
+            {
+                "version": CACHE_VERSION,
+                "value": cached.value,
+                "expires_at": cached.expires_at,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         )
         try:
-            await self.redis.set(key, envelope, ex=policy.ttl_seconds)
+            await self.redis.set(key, envelope, ex=remaining_ttl)
         except Exception as exc:
-            self._mark_unavailable(exc)
+            self._mark_redis_unavailable(exc)
 
-    def _mark_unavailable(self, exc: Exception) -> None:
+    async def _get_l3(self, key: str, now: float) -> _CacheValue | None:
+        if self.session_factory is None:
+            return None
+        try:
+            async with asyncio.timeout(L3_IO_TIMEOUT_SECONDS):
+                async with self.session_factory() as db:
+                    row = await db.get(ToolCacheEntry, key)
+                    if row is None:
+                        return None
+                    expires_at = _datetime_to_timestamp(row.expires_at)
+                    if expires_at <= now:
+                        # 过期项按 miss 处理，并顺手清理本次已经访问到的冷数据。
+                        await db.delete(row)
+                        await db.commit()
+                        return None
+                    return _CacheValue(value=row.value, expires_at=expires_at)
+        except Exception as exc:
+            logger.warning("Database L3 tool cache read failed; treating as miss: %s", exc)
+            return None
+
+    async def _put_l3(
+        self,
+        key: str,
+        tool_name: str,
+        cached: _CacheValue,
+    ) -> None:
+        if self.session_factory is None or cached.expires_at <= time.time():
+            return
+        expires_at = datetime.fromtimestamp(cached.expires_at, tz=timezone.utc)
+        try:
+            async with asyncio.timeout(L3_IO_TIMEOUT_SECONDS):
+                async with self.session_factory() as db:
+                    row = await db.get(ToolCacheEntry, key)
+                    if row is None:
+                        db.add(ToolCacheEntry(
+                            cache_key=key,
+                            tool_name=tool_name,
+                            value=cached.value,
+                            expires_at=expires_at,
+                        ))
+                    else:
+                        row.tool_name = tool_name
+                        row.value = cached.value
+                        row.expires_at = expires_at
+                        row.updated_at = datetime.now(timezone.utc)
+                    try:
+                        await db.commit()
+                    except IntegrityError:
+                        # 两个请求可能同时写同一个新 key；失败的一方回滚后更新胜者。
+                        await db.rollback()
+                        winner = await db.get(ToolCacheEntry, key)
+                        if winner is None:
+                            raise
+                        winner.tool_name = tool_name
+                        winner.value = cached.value
+                        winner.expires_at = expires_at
+                        winner.updated_at = datetime.now(timezone.utc)
+                        await db.commit()
+        except Exception as exc:
+            logger.warning("Database L3 tool cache write failed; continuing: %s", exc)
+
+    def _mark_redis_unavailable(self, exc: Exception) -> None:
         now = time.monotonic()
-        if now >= self._retry_at:
+        if now >= self._redis_retry_at:
             logger.warning(
-                "Redis tool cache unavailable; treating requests as misses for %.0fs: %s",
+                "Redis L2 tool cache unavailable; skipping it for %.0fs: %s",
                 REDIS_RETRY_SECONDS,
                 exc,
             )
-        self._retry_at = now + REDIS_RETRY_SECONDS
+        self._redis_retry_at = now + REDIS_RETRY_SECONDS
+
+
+# 兼容旧导入名；新代码应优先使用能表达真实结构的 MultiLayerCache。
+ToolCache = MultiLayerCache
 
 
 async def create_redis_client(url: str, *, enabled: bool) -> Any | None:
@@ -183,7 +388,7 @@ async def create_redis_client(url: str, *, enabled: bool) -> Any | None:
     )
     try:
         await client.ping()
-        logger.info("Redis cache and distributed rate limiting enabled")
+        logger.info("Redis L2 cache and distributed rate limiting enabled")
     except Exception as exc:
         logger.warning("Redis unavailable at startup; fail-open mode enabled: %s", exc)
     return client

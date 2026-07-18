@@ -181,6 +181,7 @@ export interface SSEToolResult {
   toolCallId: string;
   result: unknown;
   cached?: boolean;
+  cacheLayer?: "l1" | "l2" | "l3" | null;
   error: string | null;
   status?: "success" | "error" | "rejected" | "timeout";
   durationMs?: number;

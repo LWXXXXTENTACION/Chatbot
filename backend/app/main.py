@@ -18,7 +18,7 @@ from app.config import (
     REDIS_ENABLED,
     REDIS_URL,
 )
-from app.cache import ToolCache, create_redis_client
+from app.cache import MultiLayerCache, create_redis_client
 from app.database.migrate import run_migrations
 from app.graph.builder import build_graph
 from app.middleware.rate_limit import RedisRateLimiter
@@ -31,7 +31,7 @@ logger = logging.getLogger("chatbot")
 async def lifespan(app: FastAPI):
     """在一个生命周期中成对管理所有异步资源，避免连接泄漏。"""
     os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
-    from app.database.engine import engine
+    from app.database.engine import async_session, engine
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     if AUTO_MIGRATE:
@@ -48,7 +48,9 @@ async def lifespan(app: FastAPI):
         # 不再各自创建数据库连接或独立 checkpoint namespace。
         app.state.checkpointer = checkpointer
         app.state.graph = build_graph(checkpointer=checkpointer)
-        app.state.tool_cache = ToolCache(redis_client)
+        # 工具结果按 L1 内存 → L2 Redis → L3 数据库读取；Redis 未启用时仍保留
+        # 当前进程热缓存和数据库冷缓存，三层中的单层故障不会阻断聊天主链。
+        app.state.tool_cache = MultiLayerCache(redis_client, async_session)
         app.state.rate_limiter = RedisRateLimiter(redis_client)
         app.state.stream_registry = SSEStreamRegistry()
         app.state.stream_registry.start()

@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import StreamWriter
 from pydantic import ValidationError
 
+from app.cache import CacheLayer
 from app.config import DeepSeekModelId
 from app.graph.context import AgentRuntimeContext
 from app.graph.deep_search import dedupe_sources, run_deep_search_workflow
@@ -52,6 +53,7 @@ class ToolOutcome:
     output_truncated: bool = False
     rejection_reason: str | None = None
     timeout_reason: str | None = None
+    cache_layer: CacheLayer | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ def _message(call: PreparedCall, outcome: ToolOutcome) -> ToolMessage:
             "context_created_at": datetime.now(timezone.utc).isoformat(),
             "tool_outcome": {
                 "cached": outcome.cached,
+                "cache_layer": outcome.cache_layer,
                 "duration_ms": outcome.duration_ms,
                 "output_chars": outcome.output_chars,
                 "model_output_chars": outcome.model_output_chars,
@@ -195,6 +198,7 @@ async def _emit_outcome(
         "toolCallId": call.call_id,
         "result": outcome.display_output,
         "cached": outcome.cached,
+        "cacheLayer": outcome.cache_layer,
         "error": outcome.display_output.get("error"),
         "status": outcome.status,
         "durationMs": outcome.duration_ms,
@@ -317,6 +321,7 @@ async def _invoke(
     policy = call.policy
     started = time.perf_counter()
     cached = False
+    cache_layer: CacheLayer | None = None
     try:
         async with asyncio.timeout(policy.timeout_seconds):
             cache = context.tool_cache
@@ -328,6 +333,7 @@ async def _invoke(
             if lookup and lookup.hit:
                 output: Any = lookup.value
                 cached = True
+                cache_layer = lookup.layer
             else:
                 async with context.tool_budget.semaphore:
                     if call.name == "deep_search":
@@ -379,6 +385,7 @@ async def _invoke(
             output_chars=output_chars,
             model_output_chars=len(model_content),
             output_truncated=display_truncated or model_truncated,
+            cache_layer=cache_layer,
         )
     except TimeoutError:
         duration_ms = max(0, round((time.perf_counter() - started) * 1000))

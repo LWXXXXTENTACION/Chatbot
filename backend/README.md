@@ -18,7 +18,7 @@ cp ../.env.example .env
 npm run dev:all
 ```
 
-Redis 是可选依赖。未启用时，工具缓存退化为 miss，限流退化为当前进程内实现；聊天、LangGraph 和 SQLite 不受影响。
+Redis 是可选依赖。未启用时，工具缓存仍使用进程内 L1 和数据库 L3，限流退化为当前进程内实现；聊天和 LangGraph 主链不受影响。
 
 ## 代码入口
 
@@ -34,7 +34,7 @@ Redis 是可选依赖。未启用时，工具缓存退化为 miss，限流退化
 | `app/agents/research.py` | Research 子图 |
 | `app/graph/deep_search.py` | 无状态 Deep Search DAG |
 | `app/graph/tool_execution.py` | 工具白名单、Schema、额度、缓存、并发、超时和输出裁剪 |
-| `app/cache.py` | Redis 精确工具缓存、TTL 和 fail-open 熔断 |
+| `app/cache.py` | L1 内存、L2 Redis、L3 数据库的读穿透、回填、TTL 和 fail-open |
 | `app/graph/events.py` | 后端 SSE 事件类型和唯一发送入口 |
 | `app/streaming.py` | 可续传 SSE 事件日志和订阅管理 |
 
@@ -155,18 +155,46 @@ messages / model_id / system_prompt / user_id / conversation_id
 压力仍过高 ──PTL 完整轮次截断──→ 最终保护
 ```
 
-## 多层状态、缓存与持久化
+### Session Memory 不是独立于 Context 的平行系统
+
+`session_memory` 是上述五层 Context Engineering 的第二层：它提取稳定事实；
+`context_summary` 则保留时间线和阶段结论。二者由同一个 context_manager 管理，
+写入同一份 thread state，但用不同 SystemMessage 注入模型，避免把短期过程误当作
+长期偏好。
+
+## L1/L2/L3 工具缓存
+
+缓存只包围公开、幂等的工具调用，读取路径固定且可观测：
+
+```text
+规范化 tool args → L1 进程 LRU
+                        ↓ miss
+                    L2 Redis
+                        ↓ miss / unavailable
+                    L3 tool_cache_entries
+                        ↓ miss / unavailable
+                    真实工具调用
+```
+
+- L1 是 1,024 项有界 LRU；命中时没有网络和 JSON 解码。
+- L2 让多个后端进程共享热结果；命中后回填 L1。
+- L3 随业务 SQLite 持久化；Redis 重启后命中会按剩余 TTL 回填 L2/L1。
+- 三层保存同一个绝对过期时间，晋升不会延长数据寿命。
+- Redis 或数据库失败均 fail-open，继续下一层或执行真实工具；错误结果不缓存。
+- `tool_result.cacheLayer` 与 ToolMessage Trace 会记录 `l1/l2/l3`，便于评测。
+
+## 其他状态与持久化边界
 
 | 层 | 实现 | 责任 |
 |---|---|---|
 | 浏览器工作态 | React ref / Zustand | 合帧后的消息、Artifact、按 conversation 隔离的流控制器 |
 | 浏览器增量存储 | localStorage | SSE session、Last-Event-ID 和未完成消息 draft |
 | 进程内短期日志 | `ResumableSSEStream` | 断线回放，不重新执行 Graph |
-| Redis | `ToolCache` + Lua Token Bucket | 精确工具缓存和跨进程限流；故障时 fail-open |
-| 业务 SQLite | `chatbot.db` | 完整可见消息、Tool/Artifact parts、来源与 Trace 的事实来源 |
+| Redis | Lua Token Bucket | 跨进程限流；与 L2 缓存共用客户端但职责独立 |
+| 业务 SQLite | `chatbot.db` | 完整可见消息、Tool/Artifact parts、来源与 Trace 的事实来源；缓存表只是可重建派生数据 |
 | Graph SQLite | `checkpoints.db` | AgentState、summary、memory 和 thread 执行状态 |
 
-Redis 工具缓存对参数做规范化并生成带版本的 SHA-256 key。默认 TTL：Web Search 300 秒、Deep Search 600 秒、天气 60 秒、计算 24 小时；错误结果不写缓存。连接失败后 30 秒内按 cache miss 处理，限流器则退化到当前进程的内存令牌桶，因此 Redis 不是聊天成功的硬依赖。
+默认缓存 TTL：Web Search 300 秒、Deep Search 600 秒、天气 60 秒、计算 24 小时。
 
 ## 工具执行策略链
 
@@ -237,6 +265,13 @@ cd backend
 ```
 
 当前测试覆盖 Graph 拓扑、子图 xray、Supervisor 路由、Artifact、工具协议、上下文治理、SQLite checkpoint、租户存储、SSE 续传与可观测性。项目根目录还可以运行：
+
+```bash
+npm run eval:cache
+```
+
+该 eval 用受控 1ms Redis RTT 对比改造前 Redis-only 热读和改造后 L1 热读，并用
+真实临时 SQLite 验证 L3 回填与 Redis 故障降级。
 
 ```bash
 npm run eval:sse

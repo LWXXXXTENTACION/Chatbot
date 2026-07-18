@@ -49,14 +49,35 @@ OBSERVABILITY_RELEASE=skill-v2 npm run backend
 - `Token`：模型供应商返回的 input、output 与 total token usage。
 - `LLM 调用`：主回答、Supervisor、研究和上下文压缩等嵌套模型调用总数。
 - `工具调用`：该轮可观测到的工具调用，并记录缓存命中与工具错误。
+- `缓存命中层`：Tool Trace 中的 `cache_layer`，取值为 `l1/l2/l3`；未命中为空。
 - `耗时`：从开始执行到完成回复持久化前的墙钟时间。
 - `回答通过率`：`通过数 / 已评测数`；未评测 run 不进入分母。
 - `运行成功率`：工作流是否结束，只用于稳定性判断，不代表回答质量。
 
 ## 数据与权限
 
-Trace 使用现有 `message_parts` JSON 扩展位保存，不新增业务数据库表。所有评测 API
+Trace 使用现有 `message_parts` JSON 扩展位保存，不为评测本身新增业务数据库表。三层缓存的
+`tool_cache_entries` 是独立的可重建派生数据表，不保存评测结论。所有评测 API
 都要求登录，并通过 conversation ownership 做用户隔离。
 
 - `GET /api/observability/overview?limit=200`
 - `PATCH /api/observability/runs/{run_id}/evaluation`
+
+## 三层缓存性能 Eval
+
+```bash
+npm run eval:cache
+```
+
+脚本把改造前 Redis-only 热读作为基线，把改造后 L1 热读作为实验组。为避免本机
+Redis 安装、网络和其他租户流量影响结果，Redis 替身固定模拟 1ms RTT；L3 使用
+SQLAlchemy Async 连接真实临时 SQLite。输出指标包括：
+
+- before/after 的 p50、p95、mean 和总耗时；
+- p50 加速倍数与延迟下降百分比；
+- 晋升后省去的 Redis GET 次数；
+- 首次 L2 晋升、L3 SQLite 写入和 L3 回填耗时（只作冷路径观察，不设门槛）；
+- L2→L1 晋升、L3→L2/L1 回填、Redis 故障回退和 value 完整性。
+
+这是可重复微基准，不等同于线上 Redis/数据库压测；线上效果还取决于真实 RTT、
+key 热度分布、进程数和 L1 命中率。脚本要求正确性全部通过且 p50 至少提升 2 倍。

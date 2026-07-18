@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -10,14 +11,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
-from app.cache import CACHE_POLICIES, CacheLookup, ToolCache, tool_cache_key
+from app.cache import (
+    CACHE_POLICIES,
+    CacheLookup,
+    MultiLayerCache,
+    ToolCache,
+    tool_cache_key,
+)
 from app.database.messages import (
     db_message_to_langchain,
     persist_graph_messages,
     persist_user_message,
 )
 from app.database.migrate import run_migrations
-from app.database.models import Base, Conversation, Message, User
+from app.database.models import Base, Conversation, Message, ToolCacheEntry, User
 from app.middleware.rate_limit import InMemoryRateLimiter, RedisRateLimiter
 from app.streaming import stream_sse_events
 
@@ -108,6 +115,77 @@ async def test_tool_cache_is_stable_versioned_and_fail_open():
     assert CACHE_POLICIES["web_search"].ttl_seconds == 300
     redis.fail = True
     assert not (await cache.get("get_weather", {"city": "北京"})).hit
+
+
+@pytest.mark.asyncio
+async def test_multi_layer_cache_promotes_l2_and_l3_hits(tmp_path):
+    """L2/L3 命中必须向上回填，第二次读取才能稳定走进程内热路径。"""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'cache.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    redis = FakeRedis()
+    args = {"city": "上海"}
+    value = {"temperature": 28, "condition": "晴"}
+    writer = MultiLayerCache(redis, sessions)
+    await writer.put("get_weather", args, value)
+
+    async with sessions() as db:
+        row = await db.get(ToolCacheEntry, tool_cache_key("get_weather", args))
+        assert row is not None
+        assert row.value == value
+
+    # 新实例没有 L1，但复用 Redis，因此第一次命中 L2，第二次晋升为 L1。
+    from_l2 = MultiLayerCache(redis, sessions)
+    assert (await from_l2.get("get_weather", args)).layer == "l2"
+    assert (await from_l2.get("get_weather", args)).layer == "l1"
+
+    # 模拟 Redis 数据丢失/重启：L3 命中后应同时恢复 Redis 和当前进程 L1。
+    redis.values.clear()
+    redis.set_calls.clear()
+    from_l3 = MultiLayerCache(redis, sessions)
+    l3_lookup = await from_l3.get("get_weather", args)
+    assert l3_lookup == CacheLookup(hit=True, value=value, layer="l3")
+    assert redis.set_calls
+    assert (await from_l3.get("get_weather", args)).layer == "l1"
+
+    # Redis 故障只跳过 L2，不得阻断后续数据库回源。
+    redis.fail = True
+    fail_open = MultiLayerCache(redis, sessions)
+    assert (await fail_open.get("get_weather", args)).layer == "l3"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_multi_layer_cache_l1_is_bounded_and_expired_l3_is_deleted(tmp_path):
+    cache = MultiLayerCache(None, l1_max_entries=2)
+    await cache.put("get_weather", {"city": "北京"}, {"temperature": 20})
+    await cache.put("get_weather", {"city": "上海"}, {"temperature": 25})
+    await cache.put("get_weather", {"city": "广州"}, {"temperature": 30})
+    assert cache.l1_size == 2
+    assert not (await cache.get("get_weather", {"city": "北京"})).hit
+    assert (await cache.get("get_weather", {"city": "广州"})).layer == "l1"
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'expired.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    key = tool_cache_key("calculate", {"expression": "1+1"})
+    async with sessions() as db:
+        db.add(ToolCacheEntry(
+            cache_key=key,
+            tool_name="calculate",
+            value={"result": 2},
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ))
+        await db.commit()
+
+    l3_only = MultiLayerCache(None, sessions, l1_max_entries=0)
+    assert not (await l3_only.get("calculate", {"expression": "1+1"})).hit
+    async with sessions() as db:
+        assert await db.get(ToolCacheEntry, key) is None
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -234,4 +312,7 @@ def test_legacy_database_is_adopted_and_migrated(tmp_path):
     assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2
     assert connection.execute("SELECT message_sequence FROM conversations").fetchone()[0] == 2
     assert connection.execute("SELECT sequence FROM messages ORDER BY sequence").fetchall() == [(0,), (1,)]
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_cache_entries'"
+    ).fetchone() == ("tool_cache_entries",)
     connection.close()

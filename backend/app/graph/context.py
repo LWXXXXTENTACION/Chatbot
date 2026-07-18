@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Literal, cast
 
-from app.cache import ToolCache
+from app.cache import MultiLayerCache
 from app.tools.registry import MAX_CONCURRENT_TOOLS, MAX_TURN_TOOL_CALLS
 
 SearchMode = Literal["auto", "web", "deep"]
@@ -46,7 +46,7 @@ class ToolBudget:
 
 @dataclass
 class AgentRuntimeContext:
-    tool_cache: ToolCache | None = None
+    tool_cache: MultiLayerCache | None = None
     search_mode: SearchMode = "auto"
     tool_budget: ToolBudget = field(default_factory=ToolBudget)
     confirmed_tool_call_ids: frozenset[str] = field(default_factory=frozenset)

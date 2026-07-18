@@ -72,6 +72,7 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "type": "tool_result",
         "toolCallId": "tool-1",
         "cached": True,
+        "cacheLayer": "l1",
         "error": None,
         "durationMs": 25,
         "outputChars": 100,
@@ -94,6 +95,10 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
     trace = collector.finish("success")
 
     assert len(CODE_FINGERPRINT) == 64
+    tool_event = next(
+        item for item in trace["timeline"] if item["type"] == "tool.end"
+    )
+    assert tool_event["metadata"]["cache_layer"] == "l1"
     assert trace["metrics"] == {
         "input_tokens": 90,
         "output_tokens": 10,

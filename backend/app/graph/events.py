@@ -78,6 +78,7 @@ class ToolResultEvent(TypedDict):
     toolCallId: str
     result: Any
     cached: NotRequired[bool]
+    cacheLayer: NotRequired[Literal["l1", "l2", "l3"] | None]
     error: str | None
     status: NotRequired[Literal["success", "error", "rejected", "timeout"]]
     durationMs: NotRequired[int]

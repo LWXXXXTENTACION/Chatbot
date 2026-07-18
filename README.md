@@ -1,6 +1,6 @@
 # LangGraph 全栈教程 Chatbot
 
-一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、Context Engineering、Memory Engineering、多层缓存与持久化、SSE 流式传输、断点续传和 Evals。
+一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、包含会话记忆的 Context Engineering、L1/L2/L3 工具缓存、持久化、SSE 流式传输、断点续传和 Evals。
 
 项目代码优先追求“流程看得见”：业务控制流写成明确的 LangGraph `State / Node / Edge`，关键实现附有中文设计注释；纯 JSON 解析、HTML 清洗等无状态逻辑保留为普通函数，避免为了“全都叫节点”而制造无意义的 Graph。
 
@@ -15,22 +15,22 @@
 1. Multi-Agent 的职责、工具权限和最终回复如何保持单一、可审计的数据流。
 2. 长会话如何在不破坏 AI/Tool 消息配对的前提下完成上下文压缩、记忆提取和窗口兜底。
 3. SSE 如何同时解决逐 token 渲染卡顿、断流丢内容、TCP 拆包导致 JSON/Unicode 错乱，以及刷新后的增量恢复。
-4. Redis、业务数据库、LangGraph checkpoint、SSE 日志和浏览器草稿如何分工，而不是互相覆盖事实来源。
+4. 热点工具结果如何在内存、Redis、数据库之间读穿透与回填，同时不混淆业务数据库、LangGraph checkpoint、SSE 日志和浏览器草稿的职责。
 
 ### 解决方案
 
 1. 通过 Supervisor 父图和 General/Research 编译子图，实现显式任务分派与严格工作流。
 2. 通过受 Claude Code 长会话治理思路启发的五层 Context Engineering，将工具瘦身、会话记忆、滚动摘要、全量压缩和确定性截断写成可观测策略链。
 3. 通过双指针缓冲 + `requestAnimationFrame`、手动重连 + `Last-Event-ID`、Buffer 累积 + SSE 分隔符拆包，实现稳定流式输出；再用游标与草稿增量存储支持刷新恢复。
-4. 通过 Redis 精确工具缓存、SQLite 业务库、AsyncSqliteSaver、内存 SSE Journal 和浏览器 localStorage，建立按生命周期分层的状态体系。
+4. 通过 `L1 内存 → L2 Redis → L3 数据库` 的工具结果缓存降低重复 I/O；再把业务消息、Graph state、SSE Journal 和浏览器 localStorage 按恢复目标分开建模。
 
 ### 项目亮点
 
 - 支持带来源引用的 Web/Deep Search，以及 HTML、SVG、Markdown、代码和可打印 PDF 预览 Artifact。
-- 内置五层 Context Engineering 与 thread 级 Memory Engineering，保留最近轮次和完整工具协议，同时控制长会话输入成本。
-- Redis 工具缓存与分布式令牌桶均采用 fail-open 设计；Redis 不可用时聊天主链仍可运行。
+- 内置五层 Context Engineering；`session_memory` 是其中的稳定事实提取策略，不再虚构一套与 Context 平行的“Memory 系统”。
+- 工具缓存实现 L1 有界 LRU、L2 Redis、L3 数据库，支持逐级回填、按语义 TTL 和 fail-open；命中层会进入 Trace/SSE。
 - 30,000 个 SSE delta 的本地 eval 从 30,000 次 UI 发布降到 **469 次，减少 98.44%**。
-- 当前包含 **62 项后端测试**，并提供独立 Eval Lab 对比 Token、耗时、调用数和质量。
+- 当前包含 **64 项后端测试**，并提供独立 Eval Lab 对比 Token、耗时、调用数和质量。
 
 ## 你可以从这个项目学到什么
 
@@ -40,7 +40,7 @@
 - 如何为不同 Agent 配置工具白名单、Schema、额度、缓存、并发和超时。
 - 如何把模型生成的交付物转换为标准 `AIMessage.tool_calls → ToolMessage` 协议。
 - 如何用 POST SSE 实现流式输出、自动重连、页面刷新续传和会话切换隔离。
-- 如何区分业务数据库、LangGraph checkpoint、浏览器临时 draft 和 Redis 缓存。
+- 如何实现 L1/L2/L3 读穿透与写穿透缓存，并区分业务数据库、LangGraph checkpoint、浏览器临时 draft。
 - 如何把滚动摘要与会话记忆分开建模，并用 cursor 避免重复提取同一段历史。
 - 如何为 Agent 建立可重复的性能 eval 和人工质量评测。
 
@@ -93,10 +93,11 @@ flowchart TB
         Research --> Final
     end
 
-    subgraph Storage["多层状态、缓存与持久化"]
-        DB[("chatbot.db\n消息 / Tool / Artifact / Trace")]
+    subgraph Storage["状态、三层缓存与持久化"]
+        L1[("L1 进程内 LRU\n工具热结果")]
+        DB[("chatbot.db\n业务事实 / L3 工具缓存")]
         CP[("checkpoints.db\nGraph State / Summary / Memory")]
-        Redis[("Redis\n精确工具缓存 / 分布式限流")]
+        Redis[("Redis\nL2 工具缓存 / 分布式限流")]
     end
 
     Hook <--> Proxy <--> Auth
@@ -104,7 +105,7 @@ flowchart TB
     Graph --> Journal --> Proxy
     Persist <--> DB
     Graph <--> CP
-    Graph <--> Redis
+    Graph <--> L1 <--> Redis <--> DB
     Persist --> Eval
 ```
 
@@ -166,9 +167,9 @@ flowchart TD
 
 策略执行后会产生 `ContextReport`，记录压缩前后估算 Token、采用的策略、移除消息数和是否仍超限，并通过 `context_status` SSE 显示在前端活动时间线。更详细的代码路径见 [`context_manager.py`](./backend/app/graph/context_manager.py)。
 
-## Memory Engineering：记忆不是一份无限增长的聊天记录
+### Session Memory：Context Engineering 中的稳定事实层
 
-本项目把“历史消息”“滚动摘要”和“长期有用事实”分开建模：
+本项目没有把 Memory Engineering 另立成一套平行系统；会话记忆就是五层 Context Engineering 中的第二层。它把“历史消息”“滚动摘要”和“长期有用事实”分开建模：
 
 - `messages`：完整 LangChain 消息协议，包含 Human/AI/Tool 配对，是当前 thread 的执行历史。
 - `context_summary`：按时间保留任务、决定、结论、未完成事项和重要工具结论，用于替代已折叠的旧 turn。
@@ -177,20 +178,44 @@ flowchart TD
 
 `context_summary` 与 `session_memory` 会作为不同的 SystemMessage 注入模型视图，并明确标记为“历史事实而非新指令”。它们随 LangGraph thread checkpoint 持久化，作用域是当前会话，不伪装成跨用户的全局长期记忆；业务消息仍以 `chatbot.db` 为事实来源。当数据库历史与 checkpoint 不一致时，API 会删除旧 thread checkpoint，再用业务历史重建。
 
-## 多层状态、缓存与持久化
+## L1/L2/L3 工具缓存
 
-这里的“多层”不是把同一份数据重复缓存，而是按生命周期和恢复目标分工：
+只有搜索、天气、计算等公开且幂等的工具结果进入三层缓存。Artifact、错误结果、用户私有消息和 Graph state 都不会被缓存。严格读取路径如下：
+
+```mermaid
+flowchart LR
+    R["工具请求\n规范化参数 + SHA-256 key"] --> L1{"L1 进程内 LRU"}
+    L1 -->|hit| A["返回结果\ncacheLayer=l1"]
+    L1 -->|miss| L2{"L2 Redis"}
+    L2 -->|hit| P1["回填 L1"] --> A2["返回结果\ncacheLayer=l2"]
+    L2 -->|miss / 故障| L3{"L3 tool_cache_entries"}
+    L3 -->|hit| P2["按剩余 TTL 回填 L2 + L1"] --> A3["返回结果\ncacheLayer=l3"]
+    L3 -->|miss / 故障| T["执行真实工具"]
+    T --> OK{"成功且可缓存?"}
+    OK -->|是| W["L1 先写\nL2/L3 并行写"] --> OUT["返回结果"]
+    OK -->|否| OUT
+```
+
+| 缓存层 | 实现与速度定位 | 命中后的动作 | 故障策略 |
+|---|---|---|---|
+| L1 | 当前 FastAPI 进程内的 1,024 项有界 LRU | 直接返回，无网络与序列化 | 进程重启自然丢失，由下层恢复 |
+| L2 | Redis，共享给多个后端进程 | 保留原始绝对过期时间并回填 L1 | 连接错误熔断 30 秒，继续查 L3 |
+| L3 | `chatbot.db.tool_cache_entries` | 按剩余 TTL 回填 Redis 与 L1 | 读写异常 fail-open，继续执行真实工具 |
+
+三层使用同一个绝对 `expires_at`，因此从 L3 晋升不会重置或延长 TTL。默认 TTL：Web Search 300 秒、Deep Search 600 秒、天气 60 秒、计算 24 小时。Key 由规范化参数、缓存版本和必要的 `model_id` 计算 SHA-256，参数顺序不会制造假 miss，原始查询也不会直接出现在 key 中。
+
+### 它与其他状态存储的边界
+
+下面这些组件不是 L1/L2/L3 缓存；它们保存的是不同数据，并服务于不同恢复目标：
 
 | 层 | 实现 | 保存什么 | 生命周期与降级策略 |
 |---|---|---|---|
 | React/Zustand 工作态 | ref、Zustand | 当前可见消息、每个对话的 Artifact、AbortController | 高频 delta 只进 ref；按绘制帧同步 UI，切换会话按 `conversationId` 隔离 |
 | 浏览器增量存储 | localStorage | `streamId`、原始请求、`Last-Event-ID`、未完成 assistant parts | 首字节前保存 session；游标逐事件更新，草稿约 300ms 节流；`done/error` 后清理 |
 | SSE 事件日志 | `ResumableSSEStream` | 带单调 event ID 的短期 custom 事件 | 单流最多 20,000 个事件，终态默认保留 5 分钟；过期明确报错，不静默缺段 |
-| Redis 基础设施层 | `ToolCache`、Lua Token Bucket | 搜索/天气/计算的精确结果缓存、跨进程限流状态 | Web 5 分钟、Deep 10 分钟、天气 1 分钟、计算 24 小时；异常结果不缓存，Redis 故障时 fail-open |
-| 业务持久化 | `chatbot.db` | 用户、会话、消息 parts、Tool/Artifact、来源和 Trace | 用户可见内容的唯一事实来源，按用户和 conversation 隔离 |
+| Redis 限流状态 | Lua Token Bucket | 多进程共享令牌 | 与 L2 工具缓存复用 Redis 客户端，但不是同一类数据；故障时退化到进程内限流 |
+| 业务持久化 | `chatbot.db` | 用户、会话、消息 parts、Tool/Artifact、来源和 Trace | 用户可见内容的唯一事实来源；同库的 `tool_cache_entries` 只是可删除、可重建的 L3 派生数据 |
 | Graph 持久化 | `checkpoints.db` | `AgentState`、消息 reducer、summary、memory、子图进度 | `conversation_id = thread_id`；支持 LangGraph thread 恢复，不替代业务数据库 |
-
-Redis 的 key 由规范化工具参数、缓存版本和必要的 `model_id` 计算 SHA-256，避免参数顺序导致假 miss；Redis 缓存与分布式限流都在故障时退化，而不会让一次基础设施波动击穿聊天主链。
 
 ## Artifact 工作流
 
@@ -357,11 +382,14 @@ backend/.venv/bin/python -m pytest backend -q
 # SSE 前后性能与协议稳健性
 npm run eval:sse
 
+# Redis-only 基线与三层缓存热路径性能、L2/L3 回填正确性
+npm run eval:cache
+
 # Next.js 生产构建
 npm run build
 ```
 
-`npm run eval:sse` 会验证 TCP 任意拆包、Unicode、重连回放、重复事件、watchdog、调度器、session 恢复和 Artifact 恢复。独立质量评测流程见 [EVALS.md](./EVALS.md)。
+`npm run eval:sse` 会验证 TCP 任意拆包、Unicode、重连回放、重复事件、watchdog、调度器、session 恢复和 Artifact 恢复。`npm run eval:cache` 使用固定 1ms Redis RTT 和临时 SQLite，对比改造前 Redis-only 与改造后 L1 热路径，同时验证 L2→L1、L3→L2/L1 和 Redis 故障回退。独立质量评测流程见 [EVALS.md](./EVALS.md)。
 
 ## 建议学习顺序
 
@@ -371,7 +399,7 @@ npm run build
 4. [General 子图](./backend/app/agents/general.py)：学习条件边和有界工具循环。
 5. [Artifact 节点](./backend/app/agents/artifact.py)：学习确定性工具协议。
 6. [Research 子图](./backend/app/agents/research.py) 与 [Deep Search](./backend/app/graph/deep_search.py)。
-7. [工具策略链](./backend/app/graph/tool_execution.py) 与 [Redis 缓存](./backend/app/cache.py)：理解安全和 fail-open 边界。
+7. [工具策略链](./backend/app/graph/tool_execution.py) 与 [三层缓存](./backend/app/cache.py)：理解 L1/L2/L3 晋升、TTL 和 fail-open 边界。
 8. [FastAPI 流入口](./backend/app/routers/chat.py) 与 [可续传日志](./backend/app/streaming.py)。
 9. [前端 SSE Parser](./src/lib/sse-stream.ts)、[增量存储](./src/lib/sse-session.ts) 与 [流状态机](./src/hooks/useChatStream.ts)。
 10. [Artifact 恢复](./src/lib/artifacts.ts) 与 [侧栏渲染](./src/components/ArtifactPanel.tsx)。
@@ -393,7 +421,7 @@ npm run build
 │   ├── app/routers/         鉴权、会话、Chat SSE、Evals API
 │   ├── app/database/        SQLAlchemy、迁移、消息与 Trace
 │   └── tests/               Graph、SSE、存储和安全回归
-├── scripts/                 SSE 性能与稳健性 eval
+├── scripts/                 SSE 与三层缓存性能/稳健性 eval
 ├── EVALS.md                 Agent 质量评测说明
 └── compose.yaml             可选 Redis
 ```
@@ -407,4 +435,4 @@ npm run build
 - 后端：FastAPI、SQLAlchemy Async、Pydantic、POST SSE
 - 存储：SQLite、LangGraph AsyncSqliteSaver、可选 Redis
 - 模型：DeepSeek 对话/推理模型
-- 测试：Pytest、TypeScript、Next Build、自研 SSE Eval
+- 测试：Pytest、TypeScript、Next Build、自研 SSE/Cache Eval

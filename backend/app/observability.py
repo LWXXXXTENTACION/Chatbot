@@ -38,7 +38,12 @@ def _source_fingerprint() -> str:
         app_dir / "llm",
         app_dir / "tools",
     ]
-    files = [app_dir / "config.py", app_dir / "observability.py"]
+    # 缓存策略会直接改变工具调用耗时与命中行为，也必须形成新的可比较版本。
+    files = [
+        app_dir / "cache.py",
+        app_dir / "config.py",
+        app_dir / "observability.py",
+    ]
     for root in roots:
         files.extend(root.rglob("*.py"))
 
@@ -179,6 +184,7 @@ class TraceCollector:
             )
         elif event_type == "tool_result":
             cached = bool(event.get("cached"))
+            cache_layer = str(event.get("cacheLayer") or "")
             error = event.get("error")
             rejection_reason = str(event.get("rejectionReason") or "")
             timeout_reason = str(event.get("timeoutReason") or "")
@@ -206,6 +212,7 @@ class TraceCollector:
                 status="error" if error else "completed",
                 metadata={
                     "cached": cached,
+                    "cache_layer": cache_layer or None,
                     "error": bool(error),
                     "duration_ms": duration_ms,
                     "output_chars": output_chars,

@@ -2,7 +2,8 @@
 
 ``chatbot.db`` 是用户可见内容的事实来源：users/conversations/messages 保存租户与
 顺序，message_parts 保存 text、reasoning、sources 以及成对的 Tool/Artifact 输入
-输出。它与 ``checkpoints.db`` 的 Graph 执行状态分库，职责不能混淆。
+输出。tool_cache_entries 只保存可重建的 L3 工具缓存，不是业务事实。它与
+``checkpoints.db`` 的 Graph 执行状态分库，职责不能混淆。
 """
 
 import uuid
@@ -119,3 +120,21 @@ class MessagePart(Base):
     position = Column(Integer, nullable=False, default=0)
 
     message = relationship("Message", back_populates="parts")
+
+
+class ToolCacheEntry(Base):
+    """可重建的 L3 工具结果缓存；业务回答不能把该表当作事实来源。"""
+
+    __tablename__ = "tool_cache_entries"
+
+    cache_key = Column(String(128), primary_key=True)
+    tool_name = Column(String(64), nullable=False, index=True)
+    value = Column(JSON, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=_now,
+        onupdate=_now,
+        nullable=False,
+    )

@@ -1,4 +1,8 @@
-"""Async SQLAlchemy engine and session factory."""
+"""业务数据库的异步 SQLAlchemy Engine 与 Session 工厂。
+
+这里只连接 ``DATABASE_URL``（默认 chatbot.db）；LangGraph checkpoint 在应用
+lifespan 中由 AsyncSqliteSaver 独立连接，避免业务事务与 Graph 状态互相耦合。
+"""
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -18,7 +22,7 @@ async_session = async_sessionmaker(
 
 
 async def get_db() -> AsyncSession:
-    """FastAPI dependency that yields an async database session."""
+    """FastAPI 请求级 Session：路由结束后无论成功失败都关闭连接。"""
     async with async_session() as session:
         try:
             yield session

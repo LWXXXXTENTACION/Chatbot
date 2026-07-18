@@ -28,11 +28,13 @@ Redis 是可选依赖。未启用时，工具缓存退化为 miss，限流退化
 | `app/routers/chat.py` | 鉴权后的聊天入口、业务历史同步、Graph 运行和消息持久化 |
 | `app/graph/builder.py` | 只组装 Supervisor 父图 |
 | `app/graph/state.py` | Graph 输入、共享 State、输出和 TypedDict |
+| `app/graph/context_manager.py` | 五层 Context Engineering、滚动摘要与会话记忆 |
 | `app/agents/general.py` | General 子图和有界工具循环 |
 | `app/agents/artifact.py` | Artifact 计划、生成、tool-call 构造和结果汇总节点 |
 | `app/agents/research.py` | Research 子图 |
 | `app/graph/deep_search.py` | 无状态 Deep Search DAG |
 | `app/graph/tool_execution.py` | 工具白名单、Schema、额度、缓存、并发、超时和输出裁剪 |
+| `app/cache.py` | Redis 精确工具缓存、TTL 和 fail-open 熔断 |
 | `app/graph/events.py` | 后端 SSE 事件类型和唯一发送入口 |
 | `app/streaming.py` | 可续传 SSE 事件日志和订阅管理 |
 
@@ -123,7 +125,9 @@ messages / model_id / system_prompt / user_id / conversation_id
 
 当业务历史最后一条消息与 checkpoint 不一致时，API 删除该 thread 的旧 checkpoint，并用业务历史重建。业务库始终是可见消息的事实来源。
 
-## 上下文治理
+## Context Engineering：五层上下文治理
+
+该设计受 Claude Code 长会话分层治理思路启发，目标不是简单“截断到 Token 上限”，而是在保留最近对话、关键事实和完整工具协议的前提下逐级降低上下文成本。`context_manager` 是父图中的显式节点，位于 `prepare_turn` 与 `supervisor` 之间。
 
 `context_manager` 在 Supervisor 之前按顺序应用五种策略：
 
@@ -136,6 +140,33 @@ messages / model_id / system_prompt / user_id / conversation_id
 | `ptl_truncation` | 95% | 最后保护：按完整 turn 删除最早历史 |
 
 所有删除都以完整 user turn 为单位，不会把 `AIMessage.tool_calls` 与对应 `ToolMessage` 拆开。摘要模型失败时使用有界本地 fallback，不让压缩失败中断聊天。
+
+一次 summarizer 调用同时返回两个不同文档：
+
+- `context_summary`：保留时间线、任务、决定、结论、未完成事项和重要工具结论。
+- `session_memory`：只保留用户偏好、项目事实、约束、命名约定和长期待办。
+
+`session_memory_cursor` 记录已提取到的最后一条历史消息，避免同一段内容反复总结。两份文档作为不同的 SystemMessage 注入模型视图，并标记为不可信历史事实；它们随 thread checkpoint 持久化，但不会覆盖 `chatbot.db` 中的完整业务消息。
+
+```text
+旧工具 payload ──microcompact──┐
+完整旧 turn ──summary──────────┼→ 有界模型上下文 → Supervisor/Worker
+稳定事实 ──session memory──────┘
+压力仍过高 ──PTL 完整轮次截断──→ 最终保护
+```
+
+## 多层状态、缓存与持久化
+
+| 层 | 实现 | 责任 |
+|---|---|---|
+| 浏览器工作态 | React ref / Zustand | 合帧后的消息、Artifact、按 conversation 隔离的流控制器 |
+| 浏览器增量存储 | localStorage | SSE session、Last-Event-ID 和未完成消息 draft |
+| 进程内短期日志 | `ResumableSSEStream` | 断线回放，不重新执行 Graph |
+| Redis | `ToolCache` + Lua Token Bucket | 精确工具缓存和跨进程限流；故障时 fail-open |
+| 业务 SQLite | `chatbot.db` | 完整可见消息、Tool/Artifact parts、来源与 Trace 的事实来源 |
+| Graph SQLite | `checkpoints.db` | AgentState、summary、memory 和 thread 执行状态 |
+
+Redis 工具缓存对参数做规范化并生成带版本的 SHA-256 key。默认 TTL：Web Search 300 秒、Deep Search 600 秒、天气 60 秒、计算 24 小时；错误结果不写缓存。连接失败后 30 秒内按 cache miss 处理，限流器则退化到当前进程的内存令牌桶，因此 Redis 不是聊天成功的硬依赖。
 
 ## 工具执行策略链
 
@@ -184,6 +215,8 @@ FastAPI 加载业务历史并保存 HumanMessage
 - 终止标记和完成时间。
 
 断线后客户端携带相同 `stream_id` 与 `Last-Event-ID`。服务端只回放游标之后的事件，不重新运行 Graph。事件窗口已经过期时返回 `STREAM_REPLAY_EXPIRED`；用户主动停止才取消 producer。
+
+浏览器另外做增量存储：建流前保存 session，事件游标每次推进后立即保存，合帧后的 assistant parts 约每 300ms 保存为 draft；刷新时先恢复业务历史和 draft，再从游标继续订阅。终态会清理这些临时记录，因此 localStorage 只承担恢复窗口，不成为长期消息数据库。
 
 Graph 节点事件定义在 `app/graph/events.py`：
 

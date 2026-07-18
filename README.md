@@ -1,6 +1,6 @@
 # LangGraph 全栈教程 Chatbot
 
-一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、SSE 流式传输、断点续传、持久化和 Evals。
+一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、Context Engineering、Memory Engineering、多层缓存与持久化、SSE 流式传输、断点续传和 Evals。
 
 项目代码优先追求“流程看得见”：业务控制流写成明确的 LangGraph `State / Node / Edge`，关键实现附有中文设计注释；纯 JSON 解析、HTML 清洗等无状态逻辑保留为普通函数，避免为了“全都叫节点”而制造无意义的 Graph。
 
@@ -13,18 +13,22 @@
 ### 核心难点
 
 1. Multi-Agent 的职责、工具权限和最终回复如何保持单一、可审计的数据流。
-2. SSE 如何同时解决 TCP 拆包、逐 token 重渲染、断流重连和重复订阅。
-3. 长会话、工具协议、Artifact 与业务消息如何在 checkpoint 和数据库之间保持一致。
+2. 长会话如何在不破坏 AI/Tool 消息配对的前提下完成上下文压缩、记忆提取和窗口兜底。
+3. SSE 如何同时解决逐 token 渲染卡顿、断流丢内容、TCP 拆包导致 JSON/Unicode 错乱，以及刷新后的增量恢复。
+4. Redis、业务数据库、LangGraph checkpoint、SSE 日志和浏览器草稿如何分工，而不是互相覆盖事实来源。
 
 ### 解决方案
 
 1. 通过 Supervisor 父图和 General/Research 编译子图，实现显式任务分派与严格工作流。
-2. 通过增量 SSE Parser、`Last-Event-ID` 日志续传、rAF 双缓冲和单订阅所有权，实现稳定流式输出。
-3. 通过业务库、LangGraph checkpointer、工具策略链和 Artifact 标准 tool-call 协议，实现可恢复、可追踪的完整执行链。
+2. 通过受 Claude Code 长会话治理思路启发的五层 Context Engineering，将工具瘦身、会话记忆、滚动摘要、全量压缩和确定性截断写成可观测策略链。
+3. 通过双指针缓冲 + `requestAnimationFrame`、手动重连 + `Last-Event-ID`、Buffer 累积 + SSE 分隔符拆包，实现稳定流式输出；再用游标与草稿增量存储支持刷新恢复。
+4. 通过 Redis 精确工具缓存、SQLite 业务库、AsyncSqliteSaver、内存 SSE Journal 和浏览器 localStorage，建立按生命周期分层的状态体系。
 
 ### 项目亮点
 
 - 支持带来源引用的 Web/Deep Search，以及 HTML、SVG、Markdown、代码和可打印 PDF 预览 Artifact。
+- 内置五层 Context Engineering 与 thread 级 Memory Engineering，保留最近轮次和完整工具协议，同时控制长会话输入成本。
+- Redis 工具缓存与分布式令牌桶均采用 fail-open 设计；Redis 不可用时聊天主链仍可运行。
 - 30,000 个 SSE delta 的本地 eval 从 30,000 次 UI 发布降到 **469 次，减少 98.44%**。
 - 当前包含 **62 项后端测试**，并提供独立 Eval Lab 对比 Token、耗时、调用数和质量。
 
@@ -37,6 +41,7 @@
 - 如何把模型生成的交付物转换为标准 `AIMessage.tool_calls → ToolMessage` 协议。
 - 如何用 POST SSE 实现流式输出、自动重连、页面刷新续传和会话切换隔离。
 - 如何区分业务数据库、LangGraph checkpoint、浏览器临时 draft 和 Redis 缓存。
+- 如何把滚动摘要与会话记忆分开建模，并用 cursor 避免重复提取同一段历史。
 - 如何为 Agent 建立可重复的性能 eval 和人工质量评测。
 
 ## 功能一览
@@ -64,8 +69,10 @@ flowchart TB
         Buffer["FrameDeltaBuffer + rAF\n双缓冲渲染"]
         Panel["ArtifactPanel\n沙箱 iframe / Markdown / Code"]
         Eval["Eval Lab"]
+        Draft[("localStorage\nLast-Event-ID / 增量草稿")]
         UI --> Hook --> Parser --> Buffer --> UI
         Buffer --> Panel
+        Hook <--> Draft
     end
 
     subgraph Next["Next.js Route Handler"]
@@ -86,10 +93,10 @@ flowchart TB
         Research --> Final
     end
 
-    subgraph Storage["状态与基础设施"]
-        DB[("chatbot.db\n业务事实来源")]
-        CP[("checkpoints.db\nGraph 执行状态")]
-        Redis[("Redis\n工具缓存 / 分布式限流")]
+    subgraph Storage["多层状态、缓存与持久化"]
+        DB[("chatbot.db\n消息 / Tool / Artifact / Trace")]
+        CP[("checkpoints.db\nGraph State / Summary / Memory")]
+        Redis[("Redis\n精确工具缓存 / 分布式限流")]
     end
 
     Hook <--> Proxy <--> Auth
@@ -122,6 +129,68 @@ flowchart LR
 1. Supervisor 只分析和分派，不直接执行工具。
 2. Worker 的中间文本不直接展示，避免多个 Agent 同时“对用户说话”。
 3. 工具调用和工具结果进入共享消息协议，最后由 Supervisor 统一整合。
+
+## Context Engineering：受 Claude Code 启发的五层治理
+
+本项目受 Claude Code 在长会话中分层治理上下文的思路启发，但没有照搬其内部实现，而是把适合教程项目的策略重新设计成一个显式 `context_manager` 节点。它在 Supervisor 分派前运行，只压缩 **模型工作上下文与 checkpoint state**；`chatbot.db` 中用户实际看到的完整消息仍然保留。
+
+```mermaid
+flowchart TD
+    IN["完整 thread State"] --> MC["① Microcompact\n清理超过 30 分钟的旧工具大 payload"]
+    MC --> TURN["按 HumanMessage 划分完整 turn\n固定保留最近 2 轮"]
+    TURN --> MEM{"压力 ≥ 45%\n且存在新历史？"}
+    MEM -->|是| M["② Session Memory\n提取偏好 / 项目事实 / 约束 / 待办"]
+    MEM -->|否| LEVEL
+    M --> LEVEL{"上下文压力"}
+    LEVEL -->|≥ 82%| FULL["④ Full Compact\n压缩全部可处理旧历史"]
+    LEVEL -->|≥ 62%| COLLAPSE["③ Context Collapse\n压缩最早一段完整历史"]
+    LEVEL -->|< 62%| NEED{"需要更新 summary\n或 memory？"}
+    FULL --> NEED
+    COLLAPSE --> NEED
+    NEED -->|是| SUM["一次 Summarizer 调用\n输出 summary + memory JSON"]
+    NEED -->|否| CHECK
+    SUM --> APPLY["更新 summary / memory\n折叠时用 RemoveMessage 删除完整旧 turn"]
+    APPLY --> CHECK{"处理后仍 ≥ 95%？"}
+    CHECK -->|是| PTL["⑤ PTL Truncation\n确定性删除最早完整 turn"]
+    PTL --> CHECK
+    CHECK -->|否| REPORT["ContextReport + context_status SSE\n写回 checkpoint"]
+```
+
+| 层级 | 默认触发 | 解决的问题 | 关键保护 |
+|---|---:|---|---|
+| ① `microcompact` | ToolMessage 超过 30 分钟 | 旧搜索/工具大结果长期占窗口 | 保留 message ID、tool call ID、状态和协议元数据 |
+| ② `session_memory` | 压力达到 45% | 从早期历史提取用户偏好、项目事实、约束、命名约定和长期待办 | `session_memory_cursor` 保证同一段历史不重复提取 |
+| ③ `context_collapse` | 压力达到 62% | 将最早一部分完整 turn 变成滚动摘要 | 保留最近 2 轮，不拆 AI tool-call / ToolMessage |
+| ④ `full_compact` | 压力达到 82% | 一次压缩全部可处理旧历史 | 模型失败时使用有界本地摘要，主流程 fail-open |
+| ⑤ `ptl_truncation` | 压缩后仍达到 95% | 最终确定性兜底，防止超过模型输入预算 | 只删除最早完整 turn，绝不删除当前 turn |
+
+策略执行后会产生 `ContextReport`，记录压缩前后估算 Token、采用的策略、移除消息数和是否仍超限，并通过 `context_status` SSE 显示在前端活动时间线。更详细的代码路径见 [`context_manager.py`](./backend/app/graph/context_manager.py)。
+
+## Memory Engineering：记忆不是一份无限增长的聊天记录
+
+本项目把“历史消息”“滚动摘要”和“长期有用事实”分开建模：
+
+- `messages`：完整 LangChain 消息协议，包含 Human/AI/Tool 配对，是当前 thread 的执行历史。
+- `context_summary`：按时间保留任务、决定、结论、未完成事项和重要工具结论，用于替代已折叠的旧 turn。
+- `session_memory`：只保存用户偏好、身份/项目事实、约束、命名约定和长期待办，作为当前会话的记忆文档。
+- `session_memory_cursor`：记录记忆已经处理到哪条消息，避免每轮重复总结和重复消耗 Token。
+
+`context_summary` 与 `session_memory` 会作为不同的 SystemMessage 注入模型视图，并明确标记为“历史事实而非新指令”。它们随 LangGraph thread checkpoint 持久化，作用域是当前会话，不伪装成跨用户的全局长期记忆；业务消息仍以 `chatbot.db` 为事实来源。当数据库历史与 checkpoint 不一致时，API 会删除旧 thread checkpoint，再用业务历史重建。
+
+## 多层状态、缓存与持久化
+
+这里的“多层”不是把同一份数据重复缓存，而是按生命周期和恢复目标分工：
+
+| 层 | 实现 | 保存什么 | 生命周期与降级策略 |
+|---|---|---|---|
+| React/Zustand 工作态 | ref、Zustand | 当前可见消息、每个对话的 Artifact、AbortController | 高频 delta 只进 ref；按绘制帧同步 UI，切换会话按 `conversationId` 隔离 |
+| 浏览器增量存储 | localStorage | `streamId`、原始请求、`Last-Event-ID`、未完成 assistant parts | 首字节前保存 session；游标逐事件更新，草稿约 300ms 节流；`done/error` 后清理 |
+| SSE 事件日志 | `ResumableSSEStream` | 带单调 event ID 的短期 custom 事件 | 单流最多 20,000 个事件，终态默认保留 5 分钟；过期明确报错，不静默缺段 |
+| Redis 基础设施层 | `ToolCache`、Lua Token Bucket | 搜索/天气/计算的精确结果缓存、跨进程限流状态 | Web 5 分钟、Deep 10 分钟、天气 1 分钟、计算 24 小时；异常结果不缓存，Redis 故障时 fail-open |
+| 业务持久化 | `chatbot.db` | 用户、会话、消息 parts、Tool/Artifact、来源和 Trace | 用户可见内容的唯一事实来源，按用户和 conversation 隔离 |
+| Graph 持久化 | `checkpoints.db` | `AgentState`、消息 reducer、summary、memory、子图进度 | `conversation_id = thread_id`；支持 LangGraph thread 恢复，不替代业务数据库 |
+
+Redis 的 key 由规范化工具参数、缓存版本和必要的 `model_id` 计算 SHA-256，避免参数顺序导致假 miss；Redis 缓存与分布式限流都在故障时退化，而不会让一次基础设施波动击穿聊天主链。
 
 ## Artifact 工作流
 
@@ -178,14 +247,20 @@ sequenceDiagram
     end
 ```
 
-这里有四种状态，职责不要混淆：
+端到端恢复时尤其不要混淆下面四类状态；Redis 只是可选加速/限流层，完整分层见前文表格：
 
 - `chatbot.db`：用户可见消息、会话和 Trace 的业务事实来源。
 - `checkpoints.db`：LangGraph 的 thread state，用于持久化执行上下文。
 - `ResumableSSEStream`：当前生成任务的短期事件日志，用于断线回放。
 - 浏览器 session/draft：页面刷新前的临时 UI 快照，只保存恢复所需最小字段。
 
-## SSE 为什么不会乱码、重复或卡顿
+## 前端 SSE 三大痛点与增量存储
+
+| 痛点 | 根因 | 解决方案 |
+|---|---|---|
+| 1. 卡顿：逐字渲染卡死浏览器 | 每个 token 都拼接整段字符串、触发 React state 和 Markdown 重解析 | `FrameDeltaBuffer` 使用写指针/发布指针无损累积，网络 append 为 O(1)；`requestAnimationFrame` 每个绘制帧最多提交一次，隐藏标签页用 timeout 兜底 |
+| 2. 断流：重连后内容丢失或重复 | `reader.read()` 半开、HTTP 连接与生成任务耦合、重连重新执行请求 | 前端手动指数退避重连，携带同一 `streamId + Last-Event-ID`；后端 producer 与 HTTP subscriber 解耦，只从 SSE Journal 回放游标后的事件 |
+| 3. 错乱/乱码：TCP 拆包后 JSON 解析失败 | TCP chunk 不等于 SSE event，UTF-8 多字节字符、SSE frame、JSON 甚至 JS 代理对都可能跨 chunk | `TextDecoder(stream=true)` 保留半个 UTF-8 字符，`SSEFrameParser` 先 Buffer 累积再按空行分隔符拆帧，完整 `data:` 才 JSON.parse；双缓冲暂存尾部高代理，避免短暂显示 `�` |
 
 ```text
 TCP bytes
@@ -198,6 +273,15 @@ TCP bytes
 ```
 
 后端生产任务与某一个 HTTP 连接解耦。组件卸载只关闭当前 reader，不会重启 Graph；相同 `streamId` 的重连只订阅同一日志，因此不会因 HMR、切换会话或刷新产生两三个消费者重复追加同一 token。
+
+### 前端增量存储如何工作
+
+1. 发起请求前先把 `streamId + requestBody` 写入 localStorage，即使在首字节前刷新也有恢复依据。
+2. 每个 SSE frame 都推进共享 cursor；每批成功分发后只要游标变化就立即保存 `Last-Event-ID`，重复或倒退事件直接丢弃。
+3. 合帧后的 assistant parts 以约 300ms 间隔保存 draft；`pagehide`/页面隐藏时同步冲刷最后一帧。
+4. 刷新后先等待数据库历史，再恢复 draft 到 ref 双缓冲，并从同一游标继续追加，避免草稿跑到对应用户消息之前。
+5. 切换对话会取消旧 HTTP reader，但不会取消后端 producer；每条流使用独立 AbortSignal 和 `conversationId` 作用域，迟到事件不能写入新对话。
+6. 收到 `done/error` 后清除 session/draft；若后端重启或日志过期，则保留已有局部内容并明确提示，绝不盲目重跑任务。
 
 ## 设计理念
 
@@ -283,14 +367,15 @@ npm run build
 
 1. [Graph 总装配](./backend/app/graph/builder.py)：先理解父图 Node/Edge。
 2. [共享 State](./backend/app/graph/state.py)：区分业务状态和 Runtime。
-3. [General 子图](./backend/app/agents/general.py)：学习条件边和有界工具循环。
-4. [Artifact 节点](./backend/app/agents/artifact.py)：学习确定性工具协议。
-5. [Research 子图](./backend/app/agents/research.py) 与 [Deep Search](./backend/app/graph/deep_search.py)。
-6. [工具策略链](./backend/app/graph/tool_execution.py)：理解工具安全边界。
-7. [FastAPI 流入口](./backend/app/routers/chat.py) 与 [可续传日志](./backend/app/streaming.py)。
-8. [前端 SSE Parser](./src/lib/sse-stream.ts) 与 [流状态机](./src/hooks/useChatStream.ts)。
-9. [Artifact 恢复](./src/lib/artifacts.ts) 与 [侧栏渲染](./src/components/ArtifactPanel.tsx)。
-10. [架构测试](./backend/tests/test_agent_architecture.py)：用测试反向理解设计约束。
+3. [Context Manager](./backend/app/graph/context_manager.py) 与 [模型上下文构造](./backend/app/graph/model.py)：理解五层 Context 和 session memory。
+4. [General 子图](./backend/app/agents/general.py)：学习条件边和有界工具循环。
+5. [Artifact 节点](./backend/app/agents/artifact.py)：学习确定性工具协议。
+6. [Research 子图](./backend/app/agents/research.py) 与 [Deep Search](./backend/app/graph/deep_search.py)。
+7. [工具策略链](./backend/app/graph/tool_execution.py) 与 [Redis 缓存](./backend/app/cache.py)：理解安全和 fail-open 边界。
+8. [FastAPI 流入口](./backend/app/routers/chat.py) 与 [可续传日志](./backend/app/streaming.py)。
+9. [前端 SSE Parser](./src/lib/sse-stream.ts)、[增量存储](./src/lib/sse-session.ts) 与 [流状态机](./src/hooks/useChatStream.ts)。
+10. [Artifact 恢复](./src/lib/artifacts.ts) 与 [侧栏渲染](./src/components/ArtifactPanel.tsx)。
+11. [架构测试](./backend/tests/test_agent_architecture.py)：用测试反向理解设计约束。
 
 ## 项目结构
 

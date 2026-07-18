@@ -1,4 +1,8 @@
-"""Redis token bucket with a fail-open, process-local fallback."""
+"""Redis 分布式令牌桶，并提供进程内降级实现。
+
+Lua 脚本把“补充令牌、判断、扣减和设置 TTL”放在 Redis 端原子执行，多进程部署
+也共享同一用户额度；Redis 不可用时切换到本进程内存桶，保证主服务仍可使用。
+"""
 
 import logging
 import math
@@ -43,6 +47,7 @@ return {allowed, retry_after}
 
 
 class InMemoryRateLimiter:
+    """单进程降级桶；只在 Redis 关闭或短暂不可用时使用。"""
     def __init__(self) -> None:
         self._buckets: dict[str, tuple[float, float]] = {}
 
@@ -61,7 +66,7 @@ class InMemoryRateLimiter:
 
 
 class RedisRateLimiter:
-    """Atomic distributed limiter that falls back locally on Redis errors."""
+    """原子分布式限流器；Redis 异常后熔断 30 秒并使用本地桶。"""
 
     def __init__(self, redis_client: Any | None) -> None:
         self.redis = redis_client

@@ -1,4 +1,8 @@
-"""Fail-open Redis-backed exact cache for public, idempotent tools."""
+"""面向公开、幂等工具的 Redis 精确缓存。
+
+缓存不是事实来源，只用于避免相同搜索、天气或计算重复执行。Redis 故障时统一
+按 miss 处理（fail-open），不能让可选缓存成为聊天主链的单点故障。
+"""
 
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ class CacheLookup:
 
 
 CACHE_POLICIES: dict[str, CachePolicy] = {
+    # 不同结果的时效性不同，TTL 必须按工具语义设置，不能使用一个全局过期时间。
     "web_search": CachePolicy(ttl_seconds=300),
     "deep_search": CachePolicy(ttl_seconds=600),
     "get_weather": CachePolicy(ttl_seconds=60),
@@ -53,7 +58,11 @@ def tool_cache_key(
     *,
     model_id: str = "",
 ) -> str:
-    """Build a stable, versioned key from normalized tool inputs."""
+    """从规范化参数生成稳定、带版本的 key。
+
+    dict 排序、字符串空白和大小写先归一化，再计算 SHA-256；Deep Search 还包含
+    model_id，因为不同模型可能生成不同研究简报。key 中不直接暴露用户原始查询。
+    """
     if tool_name == "deep_search":
         effective_args = {
             "query": args.get("query", ""),
@@ -86,7 +95,7 @@ def tool_cache_key(
 
 
 class ToolCache:
-    """Redis exact cache that degrades to misses during outages."""
+    """Redis 精确缓存；连接异常后短暂熔断，期间全部退化为 cache miss。"""
 
     def __init__(self, redis_client: Any | None) -> None:
         self.redis = redis_client
@@ -118,6 +127,7 @@ class ToolCache:
             envelope = json.loads(raw)
             return CacheLookup(hit=True, value=envelope["value"])
         except Exception as exc:
+            # 读取缓存失败不等于工具失败，后续仍会执行真实工具。
             self._mark_unavailable(exc)
             return CacheLookup(hit=False)
 
@@ -133,6 +143,7 @@ class ToolCache:
         if policy is None or not self.enabled or time.monotonic() < self._retry_at:
             return
         if isinstance(value, dict) and value.get("error"):
+            # 错误结果不能缓存，否则一次临时故障会在整个 TTL 内持续污染回答。
             return
 
         key = tool_cache_key(tool_name, args, model_id=model_id)
@@ -158,7 +169,7 @@ class ToolCache:
 
 
 async def create_redis_client(url: str, *, enabled: bool) -> Any | None:
-    """Create a reconnecting async Redis client without making startup depend on it."""
+    """创建异步 Redis 客户端；启动探测失败只告警，不阻止 FastAPI 启动。"""
     if not enabled:
         return None
     from redis.asyncio import Redis

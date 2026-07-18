@@ -1,11 +1,8 @@
-"""
-SQLAlchemy ORM models for the chatbot application.
+"""Chatbot 业务数据库模型。
 
-Tables:
-  - users: user accounts
-  - conversations: chat conversations (scoped to user)
-  - messages: individual messages in a conversation
-  - message_parts: denormalized parts of a message (text, reasoning, tool calls)
+``chatbot.db`` 是用户可见内容的事实来源：users/conversations/messages 保存租户与
+顺序，message_parts 保存 text、reasoning、sources 以及成对的 Tool/Artifact 输入
+输出。它与 ``checkpoints.db`` 的 Graph 执行状态分库，职责不能混淆。
 """
 
 import uuid
@@ -102,6 +99,7 @@ class Message(Base):
 
 
 class MessagePart(Base):
+    """一条消息的结构化 part；Artifact 也作为标准 tool part 持久化。"""
     __tablename__ = "message_parts"
 
     id = Column(String(32), primary_key=True, default=_uuid)
@@ -111,7 +109,7 @@ class MessagePart(Base):
         nullable=False,
         index=True,
     )
-    type = Column(String(32), nullable=False)  # "text" | "reasoning" | "tool-{name}"
+    type = Column(String(32), nullable=False)  # text / reasoning / sources / tool-{name}
     text = Column(Text, nullable=True)
     tool_call_id = Column(String(64), nullable=True)
     tool_state = Column(String(24), nullable=True)

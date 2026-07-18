@@ -1,7 +1,4 @@
-"""
-Application configuration loaded from environment variables.
-Mirrors the model definitions in src/lib/models.ts.
-"""
+"""从环境变量加载应用配置；模型 ID 与 ``src/lib/models.ts`` 保持一致。"""
 
 import os
 from typing import Literal
@@ -11,7 +8,7 @@ load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_INSECURE_TLS = os.getenv("DEEPSEEK_INSECURE_TLS", "0") == "1"
-# Database
+# 两个 SQLite 文件职责不同：DATABASE_URL 是业务事实，CHECKPOINT_DB_PATH 是 Graph State。
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "sqlite+aiosqlite:///./chatbot.db"
 )
@@ -19,8 +16,8 @@ CHECKPOINT_DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./checkpoints.db")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_ENABLED = os.getenv("REDIS_ENABLED", "1").lower() not in {"0", "false", "no"}
 AUTO_MIGRATE = os.getenv("AUTO_MIGRATE", "1").lower() not in {"0", "false", "no"}
-# Upper bound for the complete prompt sent to a chat model. Checkpoints retain
-# the full thread; this budget only controls the transient model input window.
+# 五层 Context Engineering 阈值。checkpoint 保留 thread 状态，这些配置只控制
+# 每次真正发送给模型的工作上下文和何时生成 summary/memory。
 CONTEXT_MAX_INPUT_TOKENS = max(
     1024,
     int(os.getenv("CONTEXT_MAX_INPUT_TOKENS", "32000")),

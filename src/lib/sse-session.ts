@@ -18,9 +18,9 @@ export interface StorageLike {
 
 export interface SSESessionRecord {
   streamId: string;
-  /** Original POST body — replayed verbatim when resuming. */
+  /** 原始 POST body；续传时原样发送，streamId 保持不变。 */
   requestBody: string;
-  /** Last-Event-ID cursor; "" means no event was consumed yet. */
+  /** Last-Event-ID 游标；空字符串表示尚未消费首个事件。 */
   lastEventId: string;
   retryMs?: number;
   startedAt: number;
@@ -34,12 +34,12 @@ export interface SSEDraftRecord {
 
 export interface SSESessionStore {
   saveSession(conversationId: string, record: SSESessionRecord): void;
-  /** Cheap hot path: advances only the cursor fields of an existing session. */
+  /** 高频轻量路径：只推进已有 session 的游标字段。 */
   updateCursor(conversationId: string, lastEventId: string, retryMs?: number): void;
   loadSession(conversationId: string): SSESessionRecord | null;
   saveDraft(conversationId: string, draft: SSEDraftRecord): void;
   loadDraft(conversationId: string): SSEDraftRecord | null;
-  /** Drop both records (terminal event, user stop, expired stream). */
+  /** 终态、用户停止或日志过期时同时清除 session 与 draft。 */
   clear(conversationId: string): void;
 }
 
@@ -61,7 +61,7 @@ function defaultStorage(): StorageLike {
     try {
       return window.localStorage;
     } catch {
-      // storage access can throw in private mode — fall through
+      // 隐私模式可能禁止访问 storage，继续使用内存降级。
     }
   }
   return createMemoryStorage();

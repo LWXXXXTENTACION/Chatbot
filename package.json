@@ -9,7 +9,10 @@
     "backend": "cd backend && .venv/bin/python -m uvicorn app.main:app --reload --port 8000",
     "dev:all": "concurrently \"npm run dev\" \"npm run backend\"",
     "eval:sse": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/eval-sse.mjs",
-    "eval:cache": "backend/.venv/bin/python scripts/eval-cache.py"
+    "eval:cache": "backend/.venv/bin/python scripts/eval-cache.py",
+    "eval:checkpoint": "backend/.venv/bin/python scripts/eval-checkpoint.py",
+    "index:context": "cd backend && .venv/bin/python ../scripts/rebuild-context-index.py",
+    "eval:context-index": "backend/.venv/bin/python scripts/eval-context-index.py"
   },
   "dependencies": {
     "highlight.js": "^11.11.1",

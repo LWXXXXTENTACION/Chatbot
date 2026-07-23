@@ -80,7 +80,9 @@ async def _run_graph_and_stream(
     user_id: str,
     conversation_id: str,
     tool_cache: Any | None,
+    context_index: Any | None,
     search_mode: SearchMode,
+    checkpoint_cache_scope: str,
 ) -> list[BaseMessage]:
     """执行一次标准 LangGraph 流，并返回本轮新产生的消息。
 
@@ -97,7 +99,10 @@ async def _run_graph_and_stream(
     }
     config: dict[str, Any] = {"recursion_limit": 12}
     if conversation_id:
-        config["configurable"] = {"thread_id": conversation_id}
+        config["configurable"] = {
+            "thread_id": conversation_id,
+            "checkpoint_cache_scope": checkpoint_cache_scope,
+        }
     final_state: dict[str, Any] | None = None
     async for part in graph.astream(
         initial_state,
@@ -105,6 +110,7 @@ async def _run_graph_and_stream(
         context=AgentRuntimeContext(
             tool_cache=tool_cache,
             search_mode=search_mode,
+            context_index=context_index,
         ),
         stream_mode=["values", "custom"],
         subgraphs=True,
@@ -224,6 +230,7 @@ async def chat_stream(
 
     input_messages: list[BaseMessage] = []
     new_user_msg: HumanMessage | None = None
+    collector: TraceCollector | None = None
     conversation_id = body.conversation_id or ""
     graph = build_graph()
 
@@ -261,8 +268,19 @@ async def chat_stream(
         new_user_msg = HumanMessage(content=user_text, id=uuid.uuid4().hex)
 
         graph = request.app.state.graph
-        checkpoint_config = {"configurable": {"thread_id": conversation_id}}
-        snapshot = await graph.aget_state(checkpoint_config)
+        checkpoint_config = {"configurable": {
+            "thread_id": conversation_id,
+            "checkpoint_cache_scope": stream_id,
+        }}
+        collector = TraceCollector(
+            conversation_id=conversation_id,
+            user_message_id=str(new_user_msg.id),
+            model=model_id,
+            search_mode=body.search_mode,
+        )
+        # 预检和 Graph 使用完全相同的 config；Saver 直接按 stream_id 找到热 head。
+        with bind_trace(collector):
+            snapshot = await graph.aget_state(checkpoint_config)
         checkpoint_messages = (
             snapshot.values.get("messages", []) if snapshot.values else []
         )
@@ -296,12 +314,13 @@ async def chat_stream(
             media_type="application/json",
         )
 
-    collector = TraceCollector(
-        conversation_id=conversation_id,
-        user_message_id=str(new_user_msg.id) if new_user_msg else "",
-        model=model_id,
-        search_mode=body.search_mode,
-    )
+    if collector is None:
+        collector = TraceCollector(
+            conversation_id=conversation_id,
+            user_message_id=str(new_user_msg.id) if new_user_msg else "",
+            model=model_id,
+            search_mode=body.search_mode,
+        )
 
     # Graph 生产任务不属于某一条 HTTP 连接。浏览器刷新或切换对话只会断开订阅；
     # 用同一个 stream_id 重连时从日志补读，不会重新运行 Graph。
@@ -315,6 +334,7 @@ async def chat_stream(
 
     checkpointer = getattr(request.app.state, "checkpointer", None)
     tool_cache = getattr(request.app.state, "tool_cache", None)
+    context_index = getattr(request.app.state, "context_index", None)
 
     async def invalidate_checkpoint() -> None:
         if checkpointer is not None and conversation_id:
@@ -347,7 +367,9 @@ async def chat_stream(
                     str(current_user.id),
                     conversation_id,
                     tool_cache,
+                    context_index,
                     body.search_mode,
+                    stream_id,
                 )
             if conversation_id and new_messages:
                 async with async_session() as persistence_db:
@@ -380,6 +402,13 @@ async def chat_stream(
                 "message": f"生成或保存回复时发生错误: {exc}",
                 "code": "STREAM_ERROR",
             })
+        finally:
+            # 正常/异常终态都主动释放 stream 热值；TTL 只处理进程被打断的情况。
+            if checkpointer is not None:
+                try:
+                    await checkpointer.aclear_scope(stream_id)
+                except Exception:
+                    logger.exception("Failed to clear checkpoint scope %s", stream_id)
 
     graph_task = asyncio.create_task(run_and_persist())
     stream.attach_producer(graph_task)

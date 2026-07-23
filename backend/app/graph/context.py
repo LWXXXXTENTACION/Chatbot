@@ -2,10 +2,13 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from app.cache import MultiLayerCache
 from app.tools.registry import MAX_CONCURRENT_TOOLS, MAX_TURN_TOOL_CALLS
+
+if TYPE_CHECKING:
+    from app.context_index.service import ContextIndexService
 
 SearchMode = Literal["auto", "web", "deep"]
 
@@ -50,3 +53,5 @@ class AgentRuntimeContext:
     search_mode: SearchMode = "auto"
     tool_budget: ToolBudget = field(default_factory=ToolBudget)
     confirmed_tool_call_ids: frozenset[str] = field(default_factory=frozenset)
+    # 外部客户端、模型和锁只存在 Runtime，不进入可序列化 AgentState/checkpoint。
+    context_index: "ContextIndexService | None" = None

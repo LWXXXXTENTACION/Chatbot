@@ -236,7 +236,30 @@ export interface SSEContextStatus {
   pressureAfter: number;
   compactedToolResults: number;
   removedMessages: number;
+  retrievedContextTokens: number;
   overflowed: boolean;
+}
+
+export interface SSEContextRetrieval {
+  type: "context_retrieval";
+  status: string;
+  candidateCount: number;
+  returnedCount: number;
+  tokenCount: number;
+  topScore: number;
+  durationMs: number;
+  indexVersion: string;
+  nodeIds: string[];
+}
+
+export interface SSEContextIndex {
+  type: "context_index";
+  status: string;
+  documentCount: number;
+  indexedNodeCount: number;
+  skippedDocumentCount: number;
+  durationMs: number;
+  indexVersion: string;
 }
 
 export interface SSETraceSummary {
@@ -262,4 +285,6 @@ export type SSEServerMessage =
   | SSEPong
   | SSEActivity
   | SSEContextStatus
+  | SSEContextRetrieval
+  | SSEContextIndex
   | SSETraceSummary;

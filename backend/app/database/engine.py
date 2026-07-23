@@ -1,7 +1,8 @@
 """业务数据库的异步 SQLAlchemy Engine 与 Session 工厂。
 
 这里只连接 ``DATABASE_URL``（默认 chatbot.db）；LangGraph checkpoint 在应用
-lifespan 中由 AsyncSqliteSaver 独立连接，避免业务事务与 Graph 状态互相耦合。
+lifespan 中由 AsyncSqliteSaver 独立持久化，避免业务事务与 Graph super-step
+互相耦合。重复 head read 由 ``checkpointing.py`` 的 stream 级 hot cache 消除。
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine

@@ -40,6 +40,8 @@ def base_state(**overrides):
         "session_memory": "",
         "session_memory_cursor": "",
         "context_report": None,
+        "retrieved_context": [],
+        "context_archive_queue": [],
         "general_task_route": None,
         "tool_rounds": 0,
         "artifact_plan": None,
@@ -106,7 +108,9 @@ def test_main_graph_is_a_supervisor_workflow():
     assert set(graph.nodes) == {
         "__start__",
         "prepare_turn",
+        "retrieve_context",
         "context_manager",
+        "archive_context",
         "supervisor",
         "general_agent",
         "research_agent",
@@ -114,8 +118,10 @@ def test_main_graph_is_a_supervisor_workflow():
         "__end__",
     }
     edges = {(edge.source, edge.target) for edge in graph.edges}
-    assert ("prepare_turn", "context_manager") in edges
-    assert ("context_manager", "supervisor") in edges
+    assert ("prepare_turn", "retrieve_context") in edges
+    assert ("retrieve_context", "context_manager") in edges
+    assert ("context_manager", "archive_context") in edges
+    assert ("archive_context", "supervisor") in edges
     assert ("supervisor", "general_agent") in edges
     assert ("supervisor", "research_agent") in edges
     assert ("general_agent", "supervisor_finalize") in edges
@@ -253,8 +259,10 @@ def test_api_consumes_langgraph_custom_stream_without_runtime_callback():
         send_event,
         "user",
         "conversation",
-        None,
-        "auto",
+            None,
+            None,
+            "auto",
+            "stream-test",
     ))
 
     assert new_messages == [answer]
@@ -284,6 +292,8 @@ def test_prepare_turn_resets_all_coordination_state():
         "worker_result": "",
         "source_citations": [],
         "context_report": None,
+        "retrieved_context": [],
+        "context_archive_queue": [],
         "general_task_route": None,
         "tool_rounds": 0,
         "artifact_plan": None,

@@ -13,6 +13,8 @@ import type {
   ToolPartBase,
   SSEActivity,
   SSEContextStatus,
+  SSEContextRetrieval,
+  SSEContextIndex,
   SSEServerMessage,
   SearchMode,
 } from "@/lib/types";
@@ -73,6 +75,7 @@ export interface UseChatStreamReturn {
 
 const MAX_RECONNECT_ATTEMPTS = 4;
 const RECONNECT_BASE_DELAY_MS = 250;
+const STREAM_PROBE_ATTEMPTS = 3;
 // 后端每 15 秒发送 keepalive；连续 3 个周期无任何字节视为半开连接并强制续传。
 const STALL_TIMEOUT_MS = 45_000;
 // localStorage 是同步 I/O，草稿必须节流，否则会阻塞每个绘制帧。
@@ -610,6 +613,34 @@ export function useChatStream({
         break;
       }
 
+      case "context_retrieval": {
+        const retrieval = data as SSEContextRetrieval;
+        if (retrieval.returnedCount > 0 || retrieval.status === "error") {
+          setActivities((prev) => [...prev, {
+            kind: "retrieved",
+            message: retrieval.status === "error"
+              ? "历史语义索引暂不可用，已继续使用摘要与会话记忆"
+              : `召回 ${retrieval.returnedCount} 个相关历史片段（约 ${retrieval.tokenCount} tokens）`,
+            timestamp: Date.now(),
+          }]);
+        }
+        break;
+      }
+
+      case "context_index": {
+        const indexEvent = data as SSEContextIndex;
+        if (indexEvent.indexedNodeCount > 0 || indexEvent.status === "error") {
+          setActivities((prev) => [...prev, {
+            kind: "compacting",
+            message: indexEvent.status === "error"
+              ? "历史语义归档失败，聊天主流程未受影响"
+              : `已归档 ${indexEvent.indexedNodeCount} 个历史索引片段`,
+            timestamp: Date.now(),
+          }]);
+        }
+        break;
+      }
+
       case "trace_summary":
         // Persisted by the backend and consumed by the observability page.
         // The chat surface intentionally stays focused on the answer.
@@ -800,16 +831,32 @@ export function useChatStream({
 
   // --- Refresh-resume helpers (断点续传) ---
 
-  async function probeStream(streamId: string): Promise<boolean> {
-    try {
-      const res = await fetchWithAuth(
-        `/api/chat/stream/${encodeURIComponent(streamId)}/status`,
-        { method: "GET" },
-      );
-      return res.status === 204;
-    } catch {
-      return false;
+  type StreamProbeResult = "alive" | "missing" | "unavailable";
+
+  async function probeStream(streamId: string): Promise<StreamProbeResult> {
+    // 只有后端明确返回 404 才能认定流不存在。500/502 和网络错误可能只是
+    // 开发服务器重载或代理瞬断，若直接当作 missing 会错误清除可续传断点。
+    for (let attempt = 0; attempt < STREAM_PROBE_ATTEMPTS; attempt += 1) {
+      try {
+        const res = await fetchWithAuth(
+          `/api/chat/stream/${encodeURIComponent(streamId)}/status`,
+          { method: "GET" },
+        );
+        if (res.status === 204) return "alive";
+        if (res.status === 404) return "missing";
+      } catch {
+        // 下一次探测会覆盖瞬时网络错误；循环结束后保留本地断点。
+      }
+      if (attempt + 1 < STREAM_PROBE_ATTEMPTS) {
+        await new Promise<void>((resolve) => {
+          window.setTimeout(
+            resolve,
+            RECONNECT_BASE_DELAY_MS * 2 ** attempt,
+          );
+        });
+      }
     }
+    return "unavailable";
   }
 
   /** 从草稿重建 ref 工作区，后续 delta 会无缝追加在已显示内容之后。 */
@@ -910,12 +957,27 @@ export function useChatStream({
     // 首事件前刷新没有游标，盲目 POST 可能在后端重启后创建重复任务，因此先探测。
     // 已有游标的 POST 是幂等续订：命中日志或返回 409，不会悄悄重跑。
     if (!session.lastEventId) {
-      const alive = await probeStream(session.streamId);
-      if (!alive) {
+      const probe = await probeStream(session.streamId);
+      if (probe === "missing") {
         await abandonStreamSession(
           draft,
           "上次生成已中断（服务已重启或会话过期），以上为中断前内容",
         );
+        return;
+      }
+      if (probe === "unavailable") {
+        // 不清 session/draft：用户刷新后仍能继续探测，且不会重复提交原任务。
+        setActivities((prev) => [
+          ...prev,
+          {
+            kind: "analyzing",
+            message: "后端暂时不可用，已保留生成断点；服务恢复后刷新即可续传",
+            timestamp: Date.now(),
+          },
+        ]);
+        setError(new Error("暂时无法确认生成任务状态，断点已保留"));
+        setStatus("error");
+        useChatStore.getState().markStreamDone(conversationId);
         return;
       }
     }

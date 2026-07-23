@@ -39,6 +39,8 @@ __pycache__/
 backend/*.db
 backend/*.db-wal
 backend/*.db-shm
+/context_index/
+/backend/context_index/
 
 # env files (can opt-in for committing if needed)
 .env*

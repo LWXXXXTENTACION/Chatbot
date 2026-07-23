@@ -15,10 +15,18 @@ from fastapi import FastAPI
 from app.config import (
     AUTO_MIGRATE,
     CHECKPOINT_DB_PATH,
+    CONTEXT_EMBED_ALLOW_DOWNLOAD,
+    CONTEXT_EMBED_MODEL,
+    CONTEXT_INDEX_COLLECTION,
+    CONTEXT_INDEX_ENABLED,
+    CONTEXT_INDEX_PATH,
+    CONTEXT_INDEX_VERSION,
     REDIS_ENABLED,
     REDIS_URL,
 )
 from app.cache import MultiLayerCache, create_redis_client
+from app.checkpointing import CachedCheckpointSaver
+from app.context_index import ContextIndexService
 from app.database.migrate import run_migrations
 from app.graph.builder import build_graph
 from app.middleware.rate_limit import RedisRateLimiter
@@ -39,15 +47,26 @@ async def lifespan(app: FastAPI):
         logger.info("Database migrations applied")
 
     async with AsyncExitStack() as stack:
-        checkpointer = await stack.enter_async_context(
+        durable_checkpointer = await stack.enter_async_context(
             AsyncSqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
         )
-        await checkpointer.setup()
+        await durable_checkpointer.setup()
+        # Checkpoint 仍由 SQLite 持久化，包装器只按 stream 隔离最新 head 热读。
+        checkpointer = CachedCheckpointSaver(durable_checkpointer)
         redis_client = await create_redis_client(REDIS_URL, enabled=REDIS_ENABLED)
         # 父图是唯一拥有持久化 saver 的 Graph。Worker 子图继承当前调用作用域，
         # 不再各自创建数据库连接或独立 checkpoint namespace。
         app.state.checkpointer = checkpointer
         app.state.graph = build_graph(checkpointer=checkpointer)
+        app.state.context_index = ContextIndexService(
+            enabled=CONTEXT_INDEX_ENABLED,
+            path=CONTEXT_INDEX_PATH,
+            collection=CONTEXT_INDEX_COLLECTION,
+            embed_model_name=CONTEXT_EMBED_MODEL,
+            allow_model_download=CONTEXT_EMBED_ALLOW_DOWNLOAD,
+            index_version=CONTEXT_INDEX_VERSION,
+            session_factory=async_session,
+        )
         # 工具结果按 L1 内存 → L2 Redis → L3 数据库读取；Redis 未启用时仍保留
         # 当前进程热缓存和数据库冷缓存，三层中的单层故障不会阻断聊天主链。
         app.state.tool_cache = MultiLayerCache(redis_client, async_session)
@@ -59,6 +78,7 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             await app.state.stream_registry.close()
+            await app.state.context_index.close()
             if redis_client is not None:
                 await redis_client.aclose()
             await engine.dispose()

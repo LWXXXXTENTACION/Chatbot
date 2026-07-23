@@ -121,6 +121,13 @@ def _number(value: Any) -> int:
         return 0
 
 
+def _decimal(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate version-level cost, quality, and execution metrics."""
     groups: dict[str, dict[str, Any]] = {}
@@ -159,6 +166,22 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "tool_duration_ms": 0,
             "tool_output_chars": 0,
             "tool_truncations": 0,
+            "checkpoint_hot_hits": 0,
+            "checkpoint_durable_reads": 0,
+            "checkpoint_writes": 0,
+            "checkpoint_read_ms": 0.0,
+            "checkpoint_write_ms": 0.0,
+            "context_retrieval_calls": 0,
+            "context_retrieval_errors": 0,
+            "context_retrieved_chunks": 0,
+            "context_retrieved_tokens": 0,
+            "context_retrieval_ms": 0,
+            "context_index_calls": 0,
+            "context_index_errors": 0,
+            "context_indexed_documents": 0,
+            "context_indexed_nodes": 0,
+            "context_index_skipped_documents": 0,
+            "context_index_ms": 0,
             "duration_ms": 0,
             "evaluated_runs": 0,
             "passed_runs": 0,
@@ -177,6 +200,33 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         group["tool_duration_ms"] += _number(metrics.get("tool_duration_ms"))
         group["tool_output_chars"] += _number(metrics.get("tool_output_chars"))
         group["tool_truncations"] += _number(metrics.get("tool_truncations"))
+        group["checkpoint_hot_hits"] += _number(
+            metrics.get("checkpoint_hot_hits")
+        )
+        group["checkpoint_durable_reads"] += _number(
+            metrics.get("checkpoint_durable_reads")
+        )
+        group["checkpoint_writes"] += _number(metrics.get("checkpoint_writes"))
+        group["checkpoint_read_ms"] += _decimal(
+            metrics.get("checkpoint_read_ms")
+        )
+        group["checkpoint_write_ms"] += _decimal(
+            metrics.get("checkpoint_write_ms")
+        )
+        for key in (
+            "context_retrieval_calls",
+            "context_retrieval_errors",
+            "context_retrieved_chunks",
+            "context_retrieved_tokens",
+            "context_retrieval_ms",
+            "context_index_calls",
+            "context_index_errors",
+            "context_indexed_documents",
+            "context_indexed_nodes",
+            "context_index_skipped_documents",
+            "context_index_ms",
+        ):
+            group[key] += _number(metrics.get(key))
         group["duration_ms"] += _number(trace.get("duration_ms"))
         if evaluation is not None and isinstance(evaluation.get("passed"), bool):
             group["evaluated_runs"] += 1
@@ -206,6 +256,34 @@ def aggregate_versions(traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         group["avg_tool_output_chars"] = (
             round(group["tool_output_chars"] / group["tool_calls"])
             if group["tool_calls"]
+            else 0
+        )
+        checkpoint_reads = (
+            group["checkpoint_hot_hits"] + group["checkpoint_durable_reads"]
+        )
+        group["checkpoint_hot_hit_rate"] = (
+            round(group["checkpoint_hot_hits"] / checkpoint_reads, 4)
+            if checkpoint_reads
+            else 0
+        )
+        group["avg_checkpoint_read_ms"] = (
+            round(group["checkpoint_read_ms"] / checkpoint_reads, 3)
+            if checkpoint_reads
+            else 0
+        )
+        group["avg_checkpoint_write_ms"] = (
+            round(group["checkpoint_write_ms"] / group["checkpoint_writes"], 3)
+            if group["checkpoint_writes"]
+            else 0
+        )
+        group["avg_context_retrieval_ms"] = (
+            round(group["context_retrieval_ms"] / group["context_retrieval_calls"], 3)
+            if group["context_retrieval_calls"]
+            else 0
+        )
+        group["avg_context_index_ms"] = (
+            round(group["context_index_ms"] / group["context_index_calls"], 3)
+            if group["context_index_calls"]
             else 0
         )
         group["success_rate"] = round(group["successful_runs"] / runs, 4) if runs else 0

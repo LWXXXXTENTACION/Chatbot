@@ -38,6 +38,11 @@ def make_trace(*, version_id: str = "model:agent-test", status: str = "success")
             "tool_calls": 1,
             "tool_errors": 0,
             "cache_hits": 0,
+            "checkpoint_hot_hits": 1,
+            "checkpoint_durable_reads": 1,
+            "checkpoint_writes": 2,
+            "checkpoint_read_ms": 1.6,
+            "checkpoint_write_ms": 2.5,
             "sources": 0,
         },
         "context": {},
@@ -61,7 +66,28 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "maxTokens": 32000,
         "removedMessages": 1,
         "compactedToolResults": 2,
+        "retrievedContextTokens": 120,
         "overflowed": False,
+    })
+    collector.observe_event({
+        "type": "context_retrieval",
+        "status": "ok",
+        "candidateCount": 8,
+        "returnedCount": 2,
+        "tokenCount": 120,
+        "topScore": 0.91,
+        "durationMs": 14,
+        "indexVersion": "v1",
+        "nodeIds": ["n1", "n2"],
+    })
+    collector.observe_event({
+        "type": "context_index",
+        "status": "ok",
+        "documentCount": 1,
+        "indexedNodeCount": 2,
+        "skippedDocumentCount": 0,
+        "durationMs": 8,
+        "indexVersion": "v1",
     })
     collector.observe_event({
         "type": "tool_call_start",
@@ -91,6 +117,15 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         ))
     ]])
     collector.model_finished("llm-1", response=result)
+    collector.observe_checkpoint(
+        operation="read", source="durable", duration_ms=1.5
+    )
+    collector.observe_checkpoint(
+        operation="read", source="hot", duration_ms=0.1
+    )
+    collector.observe_checkpoint(
+        operation="write", source="durable", duration_ms=2.0
+    )
 
     trace = collector.finish("success")
 
@@ -112,6 +147,24 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "tool_output_chars": 100,
         "tool_truncations": 1,
         "cache_hits": 1,
+        "checkpoint_hot_hits": 1,
+        "checkpoint_durable_reads": 1,
+        "checkpoint_writes": 1,
+        "checkpoint_history_reads": 0,
+        "checkpoint_read_ms": 1.6,
+        "checkpoint_write_ms": 2.0,
+        "checkpoint_hot_hit_rate": 0.5,
+        "context_retrieval_calls": 1,
+        "context_retrieval_errors": 0,
+        "context_retrieved_chunks": 2,
+        "context_retrieved_tokens": 120,
+        "context_retrieval_ms": 14,
+        "context_index_calls": 1,
+        "context_index_errors": 0,
+        "context_indexed_documents": 1,
+        "context_indexed_nodes": 2,
+        "context_index_skipped_documents": 0,
+        "context_index_ms": 8,
         "sources": 0,
     }
     assert trace["context"]["estimated_tokens_after"] == 800
@@ -121,6 +174,9 @@ def test_trace_collector_counts_model_tool_context_and_tokens():
         "tool.end",
         "llm.start",
         "llm.end",
+        "checkpoint.summary",
+        "context.retrieval",
+        "context.index",
     }
 
 
@@ -176,6 +232,9 @@ async def test_run_traces_are_owner_scoped_evaluable_and_aggregated(tmp_path):
         assert versions[0]["runs"] == 1
         assert versions[0]["avg_tokens"] == 100
         assert versions[0]["pass_rate"] == 1.0
+        assert versions[0]["checkpoint_hot_hit_rate"] == 0.5
+        assert versions[0]["avg_checkpoint_read_ms"] == 0.8
+        assert versions[0]["avg_checkpoint_write_ms"] == 1.25
         assert versions[0]["categories"][0]["label"] == "普通对话"
 
     await engine.dispose()

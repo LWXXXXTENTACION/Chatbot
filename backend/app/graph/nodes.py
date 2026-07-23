@@ -14,6 +14,8 @@ def prepare_turn_node(_state: AgentState) -> dict[str, Any]:
         "worker_result": "",
         "source_citations": [],
         "context_report": None,
+        "retrieved_context": [],
+        "context_archive_queue": [],
         "general_task_route": None,
         "tool_rounds": 0,
         "artifact_plan": None,

@@ -245,6 +245,29 @@ function RunInspector({
     }
   }
 
+  const checkpointReads =
+    (run.metrics.checkpoint_hot_hits ?? 0)
+    + (run.metrics.checkpoint_durable_reads ?? 0);
+  const metricCards = [
+    ["Token", formatCompact(run.metrics.total_tokens)],
+    ["耗时", formatDuration(run.duration_ms)],
+    ["LLM 调用", formatNumber(run.metrics.llm_calls)],
+    ["工具调用", formatNumber(run.metrics.tool_calls)],
+    ["策略拒绝", formatNumber(run.metrics.tool_rejections ?? 0)],
+    ["工具超时", formatNumber(run.metrics.tool_timeouts ?? 0)],
+    ["工具输出", `${formatCompact(run.metrics.tool_output_chars ?? 0)} 字符`],
+    ["结果裁剪", formatNumber(run.metrics.tool_truncations ?? 0)],
+    [
+      "Checkpoint 热命中",
+      `${formatNumber(run.metrics.checkpoint_hot_hits ?? 0)}/${formatNumber(checkpointReads)}`,
+    ],
+    ["Checkpoint 读耗时", `${(run.metrics.checkpoint_read_ms ?? 0).toFixed(2)}ms`],
+    ["历史召回", `${formatNumber(run.metrics.context_retrieved_chunks ?? 0)} 片段`],
+    ["召回 Token", formatNumber(run.metrics.context_retrieved_tokens ?? 0)],
+    ["检索耗时", `${formatNumber(run.metrics.context_retrieval_ms ?? 0)}ms`],
+    ["索引写入", `${formatNumber(run.metrics.context_indexed_nodes ?? 0)} 节点`],
+  ];
+
   return (
     <aside className="border-l border-[var(--border)] bg-[var(--bg-elev)] xl:sticky xl:top-0 xl:h-[calc(100vh)] xl:overflow-y-auto">
       <div className="border-b border-[var(--border)] px-5 py-5">
@@ -271,19 +294,10 @@ function RunInspector({
       </div>
 
       <div className="grid grid-cols-2 border-b border-[var(--border)]">
-        {[
-          ["Token", formatCompact(run.metrics.total_tokens)],
-          ["耗时", formatDuration(run.duration_ms)],
-          ["LLM 调用", formatNumber(run.metrics.llm_calls)],
-          ["工具调用", formatNumber(run.metrics.tool_calls)],
-          ["策略拒绝", formatNumber(run.metrics.tool_rejections ?? 0)],
-          ["工具超时", formatNumber(run.metrics.tool_timeouts ?? 0)],
-          ["工具输出", `${formatCompact(run.metrics.tool_output_chars ?? 0)} 字符`],
-          ["结果裁剪", formatNumber(run.metrics.tool_truncations ?? 0)],
-        ].map(([label, value], index) => (
+        {metricCards.map(([label, value], index) => (
           <div
             key={label}
-            className={`px-5 py-4 ${index % 2 === 0 ? "border-r" : ""} ${index < 6 ? "border-b" : ""} border-[var(--border)]`}
+            className={`px-5 py-4 ${index % 2 === 0 ? "border-r" : ""} ${index < metricCards.length - 2 ? "border-b" : ""} border-[var(--border)]`}
           >
             <p className="text-[10px] text-[var(--fg-subtle)]">{label}</p>
             <p className="mt-1 font-mono text-lg font-semibold">{value}</p>

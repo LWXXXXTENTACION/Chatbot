@@ -111,7 +111,30 @@ class ContextStatusEvent(TypedDict):
     pressureAfter: float
     compactedToolResults: int
     removedMessages: int
+    retrievedContextTokens: int
     overflowed: bool
+
+
+class ContextRetrievalEvent(TypedDict):
+    type: Literal["context_retrieval"]
+    status: str
+    candidateCount: int
+    returnedCount: int
+    tokenCount: int
+    topScore: float
+    durationMs: int
+    indexVersion: str
+    nodeIds: list[str]
+
+
+class ContextIndexEvent(TypedDict):
+    type: Literal["context_index"]
+    status: str
+    documentCount: int
+    indexedNodeCount: int
+    skippedDocumentCount: int
+    durationMs: int
+    indexVersion: str
 
 
 class DoneEvent(TypedDict):
@@ -139,6 +162,8 @@ StreamEvent = (
     | SourcesEvent
     | ActivityEvent
     | ContextStatusEvent
+    | ContextRetrievalEvent
+    | ContextIndexEvent
     | DoneEvent
     | ErrorEvent
 )

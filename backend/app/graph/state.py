@@ -70,7 +70,24 @@ class ContextReport(TypedDict):
     pressure_after: float
     compacted_tool_results: int
     removed_messages: int
+    retrieved_context_tokens: int
     overflowed: bool
+
+
+class RetrievedContextItem(TypedDict):
+    """LlamaIndex 返回给 Graph 的轻量、可序列化历史片段。"""
+
+    node_id: str
+    text: str
+    score: float
+    message_ids: list[str]
+
+
+class ContextArchiveRef(TypedDict):
+    """等待归档的数据库范围；正文不会复制进 checkpoint。"""
+
+    start_message_id: str
+    end_message_id: str
 
 
 class AgentInput(TypedDict):
@@ -103,6 +120,8 @@ class AgentState(AgentInput):
     session_memory: str
     session_memory_cursor: str
     context_report: ContextReport | None
+    retrieved_context: list[RetrievedContextItem]
+    context_archive_queue: list[ContextArchiveRef]
 
     # 子图进度属于当前回合，必须由 prepare_turn 在每次运行前清空。
     general_task_route: GeneralTaskRoute | None

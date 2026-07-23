@@ -62,6 +62,24 @@ export interface TraceMetrics {
   tool_output_chars: number;
   tool_truncations: number;
   cache_hits: number;
+  checkpoint_hot_hits?: number;
+  checkpoint_durable_reads?: number;
+  checkpoint_writes?: number;
+  checkpoint_history_reads?: number;
+  checkpoint_read_ms?: number;
+  checkpoint_write_ms?: number;
+  checkpoint_hot_hit_rate?: number;
+  context_retrieval_calls?: number;
+  context_retrieval_errors?: number;
+  context_retrieved_chunks?: number;
+  context_retrieved_tokens?: number;
+  context_retrieval_ms?: number;
+  context_index_calls?: number;
+  context_index_errors?: number;
+  context_indexed_documents?: number;
+  context_indexed_nodes?: number;
+  context_index_skipped_documents?: number;
+  context_index_ms?: number;
   sources: number;
 }
 
@@ -107,6 +125,25 @@ export interface RunTrace {
     max_tokens?: number;
     removed_messages?: number;
     compacted_tool_results?: number;
+    retrieved_context_tokens?: number;
+    retrieval?: {
+      status: string;
+      candidate_count: number;
+      returned_count: number;
+      token_count: number;
+      top_score: number;
+      duration_ms: number;
+      index_version: string;
+      node_ids: string[];
+    };
+    index?: {
+      status: string;
+      document_count: number;
+      indexed_node_count: number;
+      skipped_document_count: number;
+      duration_ms: number;
+      index_version: string;
+    };
     overflowed?: boolean;
   };
   timeline: TraceTimelineEvent[];
@@ -145,6 +182,27 @@ export interface ObservabilityVersion {
   tool_truncations: number;
   avg_tool_duration_ms: number;
   avg_tool_output_chars: number;
+  checkpoint_hot_hits: number;
+  checkpoint_durable_reads: number;
+  checkpoint_writes: number;
+  checkpoint_read_ms: number;
+  checkpoint_write_ms: number;
+  checkpoint_hot_hit_rate: number;
+  avg_checkpoint_read_ms: number;
+  avg_checkpoint_write_ms: number;
+  context_retrieval_calls: number;
+  context_retrieval_errors: number;
+  context_retrieved_chunks: number;
+  context_retrieved_tokens: number;
+  context_retrieval_ms: number;
+  avg_context_retrieval_ms: number;
+  context_index_calls: number;
+  context_index_errors: number;
+  context_indexed_documents: number;
+  context_indexed_nodes: number;
+  context_index_skipped_documents: number;
+  context_index_ms: number;
+  avg_context_index_ms: number;
   avg_duration_ms: number;
   evaluated_runs: number;
   passed_runs: number;

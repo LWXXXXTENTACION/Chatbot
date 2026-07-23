@@ -8,7 +8,8 @@ load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_INSECURE_TLS = os.getenv("DEEPSEEK_INSECURE_TLS", "0") == "1"
-# 两个 SQLite 文件职责不同：DATABASE_URL 是业务事实，CHECKPOINT_DB_PATH 是 Graph State。
+# 两个 SQLite 文件职责不同：DATABASE_URL 是业务事实，CHECKPOINT_DB_PATH 是可回放
+# 的 Graph State；stream 级 checkpoint hot cache 只加速读取，不替代这个持久副本。
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "sqlite+aiosqlite:///./chatbot.db"
 )
@@ -39,6 +40,37 @@ CONTEXT_PTL_TRUNCATION_RATIO = float(
 CONTEXT_KEEP_RECENT_TURNS = max(
     1,
     int(os.getenv("CONTEXT_KEEP_RECENT_TURNS", "2")),
+)
+
+# 被时间顺序摘要折叠掉的完整旧轮次，会进入一个可重建的语义索引。索引故障时
+# LangGraph 主链 fail-open，context_summary / session_memory 仍可独立工作。
+CONTEXT_INDEX_ENABLED = os.getenv("CONTEXT_INDEX_ENABLED", "1").lower() not in {
+    "0", "false", "no",
+}
+CONTEXT_INDEX_PATH = os.getenv("CONTEXT_INDEX_PATH", "./context_index")
+CONTEXT_INDEX_COLLECTION = os.getenv(
+    "CONTEXT_INDEX_COLLECTION", "chat_context_v1"
+)
+CONTEXT_EMBED_MODEL = os.getenv(
+    "CONTEXT_EMBED_MODEL", "BAAI/bge-small-zh-v1.5"
+)
+# 在线聊天只使用已经下载到本机的嵌入模型。模型缺失时必须立即跳过语义召回，
+# 不能让 Hugging Face 下载占住 Graph 热路径；重建脚本会显式允许下载。
+CONTEXT_EMBED_ALLOW_DOWNLOAD = os.getenv(
+    "CONTEXT_EMBED_ALLOW_DOWNLOAD", "0"
+).lower() in {"1", "true", "yes"}
+CONTEXT_INDEX_VERSION = os.getenv("CONTEXT_INDEX_VERSION", "v1")
+CONTEXT_RETRIEVAL_TOP_K = max(
+    1, int(os.getenv("CONTEXT_RETRIEVAL_TOP_K", "8"))
+)
+CONTEXT_RETRIEVAL_MAX_CHUNKS = max(
+    1, int(os.getenv("CONTEXT_RETRIEVAL_MAX_CHUNKS", "4"))
+)
+CONTEXT_RETRIEVAL_MAX_TOKENS = max(
+    128, int(os.getenv("CONTEXT_RETRIEVAL_MAX_TOKENS", "1600"))
+)
+CONTEXT_RETRIEVAL_SCORE_THRESHOLD = float(
+    os.getenv("CONTEXT_RETRIEVAL_SCORE_THRESHOLD", "0.35")
 )
 
 # JWT

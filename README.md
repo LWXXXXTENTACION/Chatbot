@@ -1,6 +1,6 @@
 # LangGraph 全栈教程 Chatbot
 
-一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、包含会话记忆的 Context Engineering、L1/L2/L3 工具缓存、持久化、SSE 流式传输、断点续传和 Evals。
+一个面向 **LangGraph 初学者和全栈 AI 开发学习者** 的可运行教程项目。它不是只展示一次模型调用的聊天壳，而是把一个真实 AI 应用拆成可以阅读、调试和评测的完整链路：任务分派、Multi-Agent、工具执行、Artifact、五层 Context Engineering、LlamaIndex 历史语义召回、L1/L2/L3 工具缓存、持久化、SSE 流式传输、断点续传和 Evals。
 
 项目代码优先追求“流程看得见”：业务控制流写成明确的 LangGraph `State / Node / Edge`，关键实现附有中文设计注释；纯 JSON 解析、HTML 清洗等无状态逻辑保留为普通函数，避免为了“全都叫节点”而制造无意义的 Graph。
 
@@ -20,7 +20,7 @@
 ### 解决方案
 
 1. 通过 Supervisor 父图和 General/Research 编译子图，实现显式任务分派与严格工作流。
-2. 通过受 Claude Code 长会话治理思路启发的五层 Context Engineering，将工具瘦身、会话记忆、滚动摘要、全量压缩和确定性截断写成可观测策略链。
+2. 通过受 Claude Code 长会话治理思路启发的五层 Context Engineering，将工具瘦身、会话记忆、滚动摘要、全量压缩和确定性截断写成可观测策略链；被折叠的完整旧轮次再进入 LlamaIndex/Qdrant，按当前问题精确召回。
 3. 通过双指针缓冲 + `requestAnimationFrame`、手动重连 + `Last-Event-ID`、Buffer 累积 + SSE 分隔符拆包，实现稳定流式输出；再用游标与草稿增量存储支持刷新恢复。
 4. 通过 `L1 内存 → L2 Redis → L3 数据库` 的工具结果缓存降低重复 I/O；再把业务消息、Graph state、SSE Journal 和浏览器 localStorage 按恢复目标分开建模。
 
@@ -28,9 +28,10 @@
 
 - 支持带来源引用的 Web/Deep Search，以及 HTML、SVG、Markdown、代码和可打印 PDF 预览 Artifact。
 - 内置五层 Context Engineering；`session_memory` 是其中的稳定事实提取策略，不再虚构一套与 Context 平行的“Memory 系统”。
+- LlamaIndex 只承担历史分块、嵌入和 retriever；Qdrant 索引可从 `chatbot.db` 重建，主编排仍唯一属于 LangGraph。
 - 工具缓存实现 L1 有界 LRU、L2 Redis、L3 数据库，支持逐级回填、按语义 TTL 和 fail-open；命中层会进入 Trace/SSE。
 - 30,000 个 SSE delta 的本地 eval 从 30,000 次 UI 发布降到 **469 次，减少 98.44%**。
-- 当前包含 **64 项后端测试**，并提供独立 Eval Lab 对比 Token、耗时、调用数和质量。
+- 当前包含 **72 项后端测试**，并提供独立 Eval Lab 对比 Token、耗时、调用数和质量。
 
 ## 你可以从这个项目学到什么
 
@@ -86,7 +87,8 @@ flowchart TB
     end
 
     subgraph Graph["LangGraph Supervisor Workflow"]
-        Prepare["prepare_turn"] --> Context["context_manager"] --> Supervisor["supervisor"]
+        Prepare["prepare_turn"] --> Retrieve["retrieve_context"] --> Context["context_manager"]
+        Context --> Archive["archive_context"] --> Supervisor["supervisor"]
         Supervisor -->|"普通任务 / Artifact"| General["General Agent 子图"]
         Supervisor -->|"联网 / 研究"| Research["Research Agent 子图"]
         General --> Final["supervisor_finalize"]
@@ -96,7 +98,9 @@ flowchart TB
     subgraph Storage["状态、三层缓存与持久化"]
         L1[("L1 进程内 LRU\n工具热结果")]
         DB[("chatbot.db\n业务事实 / L3 工具缓存")]
-        CP[("checkpoints.db\nGraph State / Summary / Memory")]
+        CPHot[("stream 级 L1 Hot Cache\n最新 Checkpoint 去重读取")]
+        CP[("checkpoints.db\nGraph State / History / Memory")]
+        Vector[("Qdrant context_index\n可重建语义历史")]
         Redis[("Redis\nL2 工具缓存 / 分布式限流")]
     end
 
@@ -104,7 +108,8 @@ flowchart TB
     Auth --> Graph
     Graph --> Journal --> Proxy
     Persist <--> DB
-    Graph <--> CP
+    Graph <--> CPHot <--> CP
+    Graph <--> Vector
     Graph <--> L1 <--> Redis <--> DB
     Persist --> Eval
 ```
@@ -116,8 +121,10 @@ flowchart TB
 ```mermaid
 flowchart LR
     START((START)) --> PT["prepare_turn\n重置回合状态"]
-    PT --> CM["context_manager\n治理工作上下文"]
-    CM --> S["supervisor\n输出 route / task / reason"]
+    PT --> RC["retrieve_context\nLlamaIndex 语义召回"]
+    RC --> CM["context_manager\n治理工作上下文"]
+    CM --> AC["archive_context\n归档被折叠的完整旧轮次"]
+    AC --> S["supervisor\n输出 route / task / reason"]
     S -->|general_agent| G["General Agent 子图"]
     S -->|research_agent| R["Research Agent 子图"]
     G --> SF["supervisor_finalize\n唯一用户可见正文"]
@@ -178,6 +185,20 @@ flowchart TD
 
 `context_summary` 与 `session_memory` 会作为不同的 SystemMessage 注入模型视图，并明确标记为“历史事实而非新指令”。它们随 LangGraph thread checkpoint 持久化，作用域是当前会话，不伪装成跨用户的全局长期记忆；业务消息仍以 `chatbot.db` 为事实来源。当数据库历史与 checkpoint 不一致时，API 会删除旧 thread checkpoint，再用业务历史重建。
 
+### LlamaIndex：被折叠历史的语义召回层
+
+摘要擅长保留时间线，但很难保住每个很早以前的细节。因此 `retrieve_context` 会在五层治理前，按最新用户问题从当前 `user_id + conversation_id` 检索旧历史；`archive_context` 则在治理后消费轻量 `ContextArchiveRef`，重新从业务库读取被删除的完整 turn 并幂等写入索引。两者都是明确的 Graph 节点，不引入第二套 Agent/Workflow。
+
+```mermaid
+flowchart LR
+    DB[("chatbot.db\n完整业务消息")] -->|范围引用重新读取| ING["IngestionPipeline\n384 tokens / overlap 48"]
+    ING --> EMB["BAAI/bge-small-zh-v1.5"] --> Q[("Qdrant\nchat_context_v1")]
+    Q -->|user + conversation 双过滤| RET["Retriever\nTop 8 → 阈值/去重/预算 → 最多 4"]
+    RET --> MODEL["不可信历史 SystemMessage\n最多 1600 tokens"]
+```
+
+索引单位只包含用户正文、最终助手正文、来源标题和 Artifact 标题/类型；reasoning、系统提示词、原始工具 JSON 与完整 HTML/PDF 正文不会入索引。稳定 `doc_id/node_id` 保证重复运行不重复嵌入。Qdrant 是可重建派生数据，模型未下载、索引损坏或检索失败都会 fail-open 为 `retrieved_context=[]`。
+
 ## L1/L2/L3 工具缓存
 
 只有搜索、天气、计算等公开且幂等的工具结果进入三层缓存。Artifact、错误结果、用户私有消息和 Graph state 都不会被缓存。严格读取路径如下：
@@ -215,7 +236,34 @@ flowchart LR
 | SSE 事件日志 | `ResumableSSEStream` | 带单调 event ID 的短期 custom 事件 | 单流最多 20,000 个事件，终态默认保留 5 分钟；过期明确报错，不静默缺段 |
 | Redis 限流状态 | Lua Token Bucket | 多进程共享令牌 | 与 L2 工具缓存复用 Redis 客户端，但不是同一类数据；故障时退化到进程内限流 |
 | 业务持久化 | `chatbot.db` | 用户、会话、消息 parts、Tool/Artifact、来源和 Trace | 用户可见内容的唯一事实来源；同库的 `tool_cache_entries` 只是可删除、可重建的 L3 派生数据 |
-| Graph 持久化 | `checkpoints.db` | `AgentState`、消息 reducer、summary、memory、子图进度 | `conversation_id = thread_id`；支持 LangGraph thread 恢复，不替代业务数据库 |
+| Graph 热读与持久化 | `CachedCheckpointSaver` + `checkpoints.db` | 按 `stream_id` 隔离的最新 `AgentState` L1 热读；完整 checkpoint、pending writes、summary、memory 和子图进度持久化 | 写入先落 SQLite 再失效所有相关热值；history/time-travel 永远绕过缓存 |
+| 历史语义索引 | LlamaIndex + 本地 Qdrant | 被 Context Manager 折叠的完整旧 turn 向量 | 按用户/会话双过滤；故障 fail-open；可用 `npm run index:context` 从业务库重建 |
+
+### 为什么 checkpoint 不能只放热缓存
+
+Checkpoint 与工具结果缓存的语义不同：它记录每个 LangGraph super-step、父 checkpoint、pending writes 和可恢复执行位置，是恢复与回放的唯一执行状态。若只放进程内存，重启、扩容换进程或崩溃后就无法续跑；若把它当作普通 Redis value，又会丢掉父链和 time-travel 语义。
+
+本项目因此采用“持久化真值 + stream 级热路径”而不是“只留热缓存”：
+
+```mermaid
+sequenceDiagram
+    participant API as Chat API
+    participant HOT as CachedCheckpointSaver L1
+    participant DB as AsyncSqliteSaver
+    participant LG as LangGraph
+
+    API->>HOT: 同步预检 latest(scope, thread, namespace)
+    HOT->>DB: 首次 miss，读取持久 head
+    DB-->>HOT: 回填 stream scope
+    API->>LG: 启动 Graph
+    LG->>HOT: 再读 latest(thread_id)
+    HOT-->>LG: hit，无第二次 SQLite read
+    LG->>DB: 每个 super-step 持久写入
+    DB-->>HOT: 写成功后失效旧 head
+    Note over HOT,DB: history / checkpoint_id / time-travel 始终直读 DB
+```
+
+Chat 预检和 Graph `astream` 把同一个 `stream_id` 写进 `checkpoint_cache_scope`，Saver 直接用 `(scope, thread_id, checkpoint_ns)` 查 L1，不再依赖路由 `ContextVar`。Graph 结束后主动清 scope，120 秒 TTL 和 2,048 项上限只负责异常退出兜底；热命中返回深拷贝。其命中、持久读写次数及耗时进入 Trace 和 `checkpoint.summary`。
 
 ## Artifact 工作流
 
@@ -275,7 +323,9 @@ sequenceDiagram
 端到端恢复时尤其不要混淆下面四类状态；Redis 只是可选加速/限流层，完整分层见前文表格：
 
 - `chatbot.db`：用户可见消息、会话和 Trace 的业务事实来源。
-- `checkpoints.db`：LangGraph 的 thread state，用于持久化执行上下文。
+- stream 级 Checkpoint Hot Cache：仅去重同一轮预检与 Graph 启动的 latest read。
+- `checkpoints.db`：LangGraph thread state 的持久真值，用于重启恢复、history 和 time-travel。
+- `context_index/`：LlamaIndex/Qdrant 可重建语义索引，不是业务或执行状态真值。
 - `ResumableSSEStream`：当前生成任务的短期事件日志，用于断线回放。
 - 浏览器 session/draft：页面刷新前的临时 UI 快照，只保存恢复所需最小字段。
 
@@ -385,22 +435,34 @@ npm run eval:sse
 # Redis-only 基线与三层缓存热路径性能、L2/L3 回填正确性
 npm run eval:cache
 
+# Checkpoint durable-only 与 stream 级 hot cache 前后性能、恢复/回放语义
+npm run eval:checkpoint
+
+# LlamaIndex RetrieverEvaluator：Hit Rate / MRR / Recall@4 / 延迟 / 租户隔离
+npm run eval:context-index
+
+# 从 chatbot.db 全量或按 conversation 重建 Qdrant 派生索引
+npm run index:context -- --prune-orphans
+
 # Next.js 生产构建
 npm run build
 ```
 
-`npm run eval:sse` 会验证 TCP 任意拆包、Unicode、重连回放、重复事件、watchdog、调度器、session 恢复和 Artifact 恢复。`npm run eval:cache` 使用固定 1ms Redis RTT 和临时 SQLite，对比改造前 Redis-only 与改造后 L1 热路径，同时验证 L2→L1、L3→L2/L1 和 Redis 故障回退。独立质量评测流程见 [EVALS.md](./EVALS.md)。
+在线聊天不会自动下载嵌入模型：模型未就绪时语义召回会立即降级为空，
+普通问答仍照常执行。首次使用请单独运行 `npm run index:context` 准备模型和索引。
+
+`npm run eval:sse` 会验证 TCP 任意拆包、Unicode、重连回放、重复事件、watchdog、调度器、session 恢复和 Artifact 恢复。`npm run eval:cache` 使用固定 1ms Redis RTT 和临时 SQLite，对比改造前 Redis-only 与改造后 L1 热路径。`npm run eval:checkpoint` 使用真实临时 AsyncSqliteSaver，对比重复 durable read 与 stream 级 hot read，同时强制验证 history、time-travel、写穿透和重启恢复。`npm run eval:context-index` 使用人工标注中英文集和 LlamaIndex `RetrieverEvaluator`，比较 summary/memory 基线与语义召回后的关键事实命中率。独立质量评测流程见 [EVALS.md](./EVALS.md)。
 
 ## 建议学习顺序
 
 1. [Graph 总装配](./backend/app/graph/builder.py)：先理解父图 Node/Edge。
 2. [共享 State](./backend/app/graph/state.py)：区分业务状态和 Runtime。
-3. [Context Manager](./backend/app/graph/context_manager.py) 与 [模型上下文构造](./backend/app/graph/model.py)：理解五层 Context 和 session memory。
+3. [Context Manager](./backend/app/graph/context_manager.py)、[语义索引服务](./backend/app/context_index/service.py) 与 [模型上下文构造](./backend/app/graph/model.py)：理解五层 Context、session memory 和历史召回。
 4. [General 子图](./backend/app/agents/general.py)：学习条件边和有界工具循环。
 5. [Artifact 节点](./backend/app/agents/artifact.py)：学习确定性工具协议。
 6. [Research 子图](./backend/app/agents/research.py) 与 [Deep Search](./backend/app/graph/deep_search.py)。
 7. [工具策略链](./backend/app/graph/tool_execution.py) 与 [三层缓存](./backend/app/cache.py)：理解 L1/L2/L3 晋升、TTL 和 fail-open 边界。
-8. [FastAPI 流入口](./backend/app/routers/chat.py) 与 [可续传日志](./backend/app/streaming.py)。
+8. [Checkpoint 热路径](./backend/app/checkpointing.py)、[FastAPI 流入口](./backend/app/routers/chat.py) 与 [可续传日志](./backend/app/streaming.py)。
 9. [前端 SSE Parser](./src/lib/sse-stream.ts)、[增量存储](./src/lib/sse-session.ts) 与 [流状态机](./src/hooks/useChatStream.ts)。
 10. [Artifact 恢复](./src/lib/artifacts.ts) 与 [侧栏渲染](./src/components/ArtifactPanel.tsx)。
 11. [架构测试](./backend/tests/test_agent_architecture.py)：用测试反向理解设计约束。

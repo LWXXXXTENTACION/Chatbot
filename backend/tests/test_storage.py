@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from app.cache import (
+    BoundedTTLCache,
     CACHE_POLICIES,
     CacheLookup,
     MultiLayerCache,
@@ -51,6 +52,19 @@ class FakeRedis:
         if self.fail:
             raise ConnectionError("redis down")
         return self.eval_result
+
+
+@pytest.mark.asyncio
+async def test_bounded_ttl_cache_supports_none_lru_and_explicit_invalidation():
+    cache = BoundedTTLCache[str, object](max_entries=2, default_ttl_seconds=10)
+    await cache.put("none", None)
+    assert (await cache.get_entry("none")).value is None  # type: ignore[union-attr]
+    await cache.put("second", 2)
+    await cache.get_entry("none")
+    await cache.put("third", 3)
+    assert await cache.get_entry("second") is None
+    await cache.invalidate_where(lambda key: key.startswith("t"))
+    assert await cache.get_entry("third") is None
 
 
 @pytest.mark.asyncio

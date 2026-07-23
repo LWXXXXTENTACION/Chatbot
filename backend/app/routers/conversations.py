@@ -195,5 +195,18 @@ async def delete_conversation(
                 "Conversation deleted but checkpoint cleanup failed: %s",
                 conversation_id,
             )
+    context_index = getattr(request.app.state, "context_index", None)
+    if context_index is not None:
+        try:
+            await context_index.delete_conversation(
+                user_id=str(current_user.id),
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            # 向量索引是可重建派生数据，清理失败不能回滚已完成的业务删除。
+            logger.exception(
+                "Conversation deleted but context index cleanup failed: %s",
+                conversation_id,
+            )
     logger.info(f"Conversation deleted: {conversation_id} by {current_user.username}")
     return {"ok": True}

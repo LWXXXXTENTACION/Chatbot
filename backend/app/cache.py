@@ -14,9 +14,10 @@ import logging
 import math
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Generic, Literal, TypeVar
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -32,6 +33,82 @@ DEFAULT_L1_MAX_ENTRIES = 1024
 L3_IO_TIMEOUT_SECONDS = 1.0
 
 CacheLayer = Literal["l1", "l2", "l3"]
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+@dataclass(frozen=True, slots=True)
+class TTLCacheEntry(Generic[V]):
+    """显式区分“没有 key”和“缓存值恰好为 None”。"""
+
+    value: V
+
+
+@dataclass(frozen=True, slots=True)
+class _TTLValue(Generic[V]):
+    value: V
+    expires_at: float
+
+
+class BoundedTTLCache(Generic[K, V]):
+    """异步安全的有界 TTL/LRU，供不同热路径复用。
+
+    这个类只提供进程内性能加速，不承担任何持久化语义。每次读都会推进 LRU，
+    写满后淘汰最久未访问项；TTL 使用 monotonic clock，不受系统时间调整影响。
+    """
+
+    def __init__(self, *, max_entries: int, default_ttl_seconds: float) -> None:
+        self.max_entries = max(0, max_entries)
+        self.default_ttl_seconds = max(0.0, default_ttl_seconds)
+        self._values: OrderedDict[K, _TTLValue[V]] = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    @property
+    def size(self) -> int:
+        return len(self._values)
+
+    async def get_entry(self, key: K) -> TTLCacheEntry[V] | None:
+        if self.max_entries <= 0:
+            return None
+        now = time.monotonic()
+        async with self._lock:
+            cached = self._values.get(key)
+            if cached is None:
+                return None
+            if cached.expires_at <= now:
+                self._values.pop(key, None)
+                return None
+            self._values.move_to_end(key)
+            return TTLCacheEntry(cached.value)
+
+    async def put(
+        self,
+        key: K,
+        value: V,
+        *,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        ttl = self.default_ttl_seconds if ttl_seconds is None else max(0.0, ttl_seconds)
+        if self.max_entries <= 0 or ttl <= 0:
+            return
+        async with self._lock:
+            self._values[key] = _TTLValue(value, time.monotonic() + ttl)
+            self._values.move_to_end(key)
+            while len(self._values) > self.max_entries:
+                self._values.popitem(last=False)
+
+    async def invalidate(self, key: K) -> None:
+        async with self._lock:
+            self._values.pop(key, None)
+
+    async def invalidate_where(self, predicate: Callable[[K], bool]) -> None:
+        async with self._lock:
+            for key in [key for key in self._values if predicate(key)]:
+                self._values.pop(key, None)
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._values.clear()
 
 
 @dataclass(frozen=True)
@@ -144,8 +221,12 @@ class MultiLayerCache:
         self.redis = redis_client
         self.session_factory = session_factory
         self.l1_max_entries = max(0, l1_max_entries)
-        self._l1: OrderedDict[str, _CacheValue] = OrderedDict()
-        self._l1_lock = asyncio.Lock()
+        self._l1 = BoundedTTLCache[str, _CacheValue](
+            max_entries=self.l1_max_entries,
+            default_ttl_seconds=max(
+                policy.ttl_seconds for policy in CACHE_POLICIES.values()
+            ),
+        )
         self._redis_retry_at = 0.0
 
     @property
@@ -159,7 +240,7 @@ class MultiLayerCache:
     @property
     def l1_size(self) -> int:
         """仅供运行观测与 eval 使用；缓存读写仍必须经过锁保护的方法。"""
-        return len(self._l1)
+        return self._l1.size
 
     async def get(
         self,
@@ -227,30 +308,28 @@ class MultiLayerCache:
 
     async def clear_l1(self) -> None:
         """清空当前进程热缓存，主要用于测试重启/跨层回填。"""
-        async with self._l1_lock:
-            self._l1.clear()
+        await self._l1.clear()
 
     async def _get_l1(self, key: str, now: float) -> _CacheValue | None:
         if self.l1_max_entries <= 0:
             return None
-        async with self._l1_lock:
-            cached = self._l1.get(key)
-            if cached is None:
-                return None
-            if cached.expires_at <= now:
-                self._l1.pop(key, None)
-                return None
-            self._l1.move_to_end(key)
-            return cached
+        entry = await self._l1.get_entry(key)
+        if entry is None:
+            return None
+        cached = entry.value
+        if cached.expires_at <= now:
+            await self._l1.invalidate(key)
+            return None
+        return cached
 
     async def _put_l1(self, key: str, cached: _CacheValue) -> None:
         if self.l1_max_entries <= 0 or cached.expires_at <= time.time():
             return
-        async with self._l1_lock:
-            self._l1[key] = cached
-            self._l1.move_to_end(key)
-            while len(self._l1) > self.l1_max_entries:
-                self._l1.popitem(last=False)
+        await self._l1.put(
+            key,
+            cached,
+            ttl_seconds=cached.expires_at - time.time(),
+        )
 
     async def _get_l2(self, key: str, now: float) -> _CacheValue | None:
         if self.redis is None or time.monotonic() < self._redis_retry_at:

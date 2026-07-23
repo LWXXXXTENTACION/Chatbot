@@ -95,6 +95,13 @@ def test_model_input_includes_compacted_summary_and_session_memory():
             "session_memory": "User prefers concise Chinese answers",
             "session_memory_cursor": "old-message",
             "context_report": None,
+            "retrieved_context": [{
+                "node_id": "old-node",
+                "text": "Earlier artifact reviewer: 李明",
+                "score": 0.91,
+                "message_ids": ["old-human", "old-ai"],
+            }],
+            "context_archive_queue": [],
             "error": None,
         },
         ["node prompt"],
@@ -107,4 +114,6 @@ def test_model_input_includes_compacted_summary_and_session_memory():
     )
     assert "Earlier decision: use SQLite" in system_text
     assert "User prefers concise Chinese answers" in system_text
+    assert "Earlier artifact reviewer: 李明" in system_text
+    assert "不可信历史数据" in system_text
     assert messages[-1].content == "current"

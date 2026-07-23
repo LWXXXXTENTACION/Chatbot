@@ -21,7 +21,7 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 
 
-TRACE_SCHEMA_VERSION = 2
+TRACE_SCHEMA_VERSION = 4
 MAX_TIMELINE_EVENTS = 160
 
 
@@ -34,6 +34,7 @@ def _source_fingerprint() -> str:
     app_dir = Path(__file__).resolve().parent
     roots = [
         app_dir / "agents",
+        app_dir / "context_index",
         app_dir / "graph",
         app_dir / "llm",
         app_dir / "tools",
@@ -41,6 +42,7 @@ def _source_fingerprint() -> str:
     # 缓存策略会直接改变工具调用耗时与命中行为，也必须形成新的可比较版本。
     files = [
         app_dir / "cache.py",
+        app_dir / "checkpointing.py",
         app_dir / "config.py",
         app_dir / "observability.py",
     ]
@@ -139,6 +141,23 @@ class TraceCollector:
         self._tool_output_chars = 0
         self._tool_truncations = 0
         self._cache_hits = 0
+        self._checkpoint_hot_hits = 0
+        self._checkpoint_durable_reads = 0
+        self._checkpoint_writes = 0
+        self._checkpoint_history_reads = 0
+        self._checkpoint_read_ms = 0.0
+        self._checkpoint_write_ms = 0.0
+        self._context_retrieval_calls = 0
+        self._context_retrieval_errors = 0
+        self._context_retrieved_chunks = 0
+        self._context_retrieved_tokens = 0
+        self._context_retrieval_ms = 0
+        self._context_index_calls = 0
+        self._context_index_errors = 0
+        self._context_indexed_documents = 0
+        self._context_indexed_nodes = 0
+        self._context_index_skipped_documents = 0
+        self._context_index_ms = 0
         self._sources = 0
         self._context: dict[str, Any] = {}
 
@@ -224,12 +243,16 @@ class TraceCollector:
             )
         elif event_type == "context_status":
             self._context = {
+                **self._context,
                 "strategies": list(event.get("strategies") or []),
                 "estimated_tokens_before": _integer(event.get("estimatedTokensBefore")),
                 "estimated_tokens_after": _integer(event.get("estimatedTokensAfter")),
                 "max_tokens": _integer(event.get("maxTokens")),
                 "removed_messages": _integer(event.get("removedMessages")),
                 "compacted_tool_results": _integer(event.get("compactedToolResults")),
+                "retrieved_context_tokens": _integer(
+                    event.get("retrievedContextTokens")
+                ),
                 "overflowed": bool(event.get("overflowed")),
             }
             strategies = self._context["strategies"]
@@ -238,6 +261,58 @@ class TraceCollector:
                 "上下文检查" if not strategies else f"上下文优化：{', '.join(strategies)}",
                 status="error" if self._context["overflowed"] else "completed",
                 metadata=self._context,
+            )
+        elif event_type == "context_retrieval":
+            status = str(event.get("status") or "unknown")
+            duration_ms = _integer(event.get("durationMs"))
+            returned = _integer(event.get("returnedCount"))
+            tokens = _integer(event.get("tokenCount"))
+            self._context_retrieval_calls += 1
+            self._context_retrieval_errors += int(status == "error")
+            self._context_retrieved_chunks += returned
+            self._context_retrieved_tokens += tokens
+            self._context_retrieval_ms += duration_ms
+            self._context["retrieval"] = {
+                "status": status,
+                "candidate_count": _integer(event.get("candidateCount")),
+                "returned_count": returned,
+                "token_count": tokens,
+                "top_score": float(event.get("topScore") or 0.0),
+                "duration_ms": duration_ms,
+                "index_version": str(event.get("indexVersion") or ""),
+                "node_ids": [str(value) for value in event.get("nodeIds", [])],
+            }
+            self._append(
+                "context.retrieval",
+                f"语义历史召回 {returned} 个片段",
+                status="error" if status == "error" else "completed",
+                metadata=self._context["retrieval"],
+            )
+        elif event_type == "context_index":
+            status = str(event.get("status") or "unknown")
+            duration_ms = _integer(event.get("durationMs"))
+            documents = _integer(event.get("documentCount"))
+            indexed_nodes = _integer(event.get("indexedNodeCount"))
+            skipped = _integer(event.get("skippedDocumentCount"))
+            self._context_index_calls += 1
+            self._context_index_errors += int(status == "error")
+            self._context_indexed_documents += documents
+            self._context_indexed_nodes += indexed_nodes
+            self._context_index_skipped_documents += skipped
+            self._context_index_ms += duration_ms
+            self._context["index"] = {
+                "status": status,
+                "document_count": documents,
+                "indexed_node_count": indexed_nodes,
+                "skipped_document_count": skipped,
+                "duration_ms": duration_ms,
+                "index_version": str(event.get("indexVersion") or ""),
+            }
+            self._append(
+                "context.index",
+                f"语义归档新增 {indexed_nodes}、跳过 {skipped}",
+                status="error" if status == "error" else "completed",
+                metadata=self._context["index"],
             )
         elif event_type == "sources":
             sources = event.get("sources")
@@ -267,6 +342,26 @@ class TraceCollector:
             status="running",
             event_id=run_id,
         )
+
+    def observe_checkpoint(
+        self,
+        *,
+        operation: str,
+        source: str,
+        duration_ms: float,
+    ) -> None:
+        """累计 checkpoint 热读/持久读写，不把每个 super-step 都塞进时间线。"""
+        if operation == "read":
+            self._checkpoint_read_ms += max(0.0, duration_ms)
+            if source == "hot":
+                self._checkpoint_hot_hits += 1
+            else:
+                self._checkpoint_durable_reads += 1
+        elif operation == "write":
+            self._checkpoint_writes += 1
+            self._checkpoint_write_ms += max(0.0, duration_ms)
+        elif operation == "history":
+            self._checkpoint_history_reads += 1
 
     def model_finished(
         self,
@@ -298,6 +393,38 @@ class TraceCollector:
         duration_ms = self._elapsed_ms()
         short_fingerprint = CODE_FINGERPRINT[:10]
         version_label = RELEASE_LABEL or f"agent-{short_fingerprint}"
+        checkpoint_reads = (
+            self._checkpoint_hot_hits + self._checkpoint_durable_reads
+        )
+        checkpoint_hot_hit_rate = (
+            self._checkpoint_hot_hits / checkpoint_reads
+            if checkpoint_reads
+            else 0.0
+        )
+        timeline = list(self._timeline)
+        if (
+            checkpoint_reads or self._checkpoint_writes or self._checkpoint_history_reads
+        ) and len(timeline) < MAX_TIMELINE_EVENTS:
+            timeline.append({
+                "id": uuid.uuid4().hex,
+                "type": "checkpoint.summary",
+                "label": (
+                    f"Checkpoint 热缓存命中 {self._checkpoint_hot_hits}/"
+                    f"{checkpoint_reads}，持久读 {self._checkpoint_durable_reads}，"
+                    f"持久写 {self._checkpoint_writes}"
+                ),
+                "status": "completed",
+                "at_ms": duration_ms,
+                "metadata": {
+                    "hot_hits": self._checkpoint_hot_hits,
+                    "durable_reads": self._checkpoint_durable_reads,
+                    "writes": self._checkpoint_writes,
+                    "history_reads": self._checkpoint_history_reads,
+                    "hot_hit_rate": round(checkpoint_hot_hit_rate, 4),
+                    "read_ms": round(self._checkpoint_read_ms, 3),
+                    "write_ms": round(self._checkpoint_write_ms, 3),
+                },
+            })
         return {
             "schema_version": TRACE_SCHEMA_VERSION,
             "run_id": self.run_id,
@@ -328,10 +455,30 @@ class TraceCollector:
                 "tool_output_chars": self._tool_output_chars,
                 "tool_truncations": self._tool_truncations,
                 "cache_hits": self._cache_hits,
+                "checkpoint_hot_hits": self._checkpoint_hot_hits,
+                "checkpoint_durable_reads": self._checkpoint_durable_reads,
+                "checkpoint_writes": self._checkpoint_writes,
+                "checkpoint_history_reads": self._checkpoint_history_reads,
+                "checkpoint_read_ms": round(self._checkpoint_read_ms, 3),
+                "checkpoint_write_ms": round(self._checkpoint_write_ms, 3),
+                "checkpoint_hot_hit_rate": round(checkpoint_hot_hit_rate, 4),
+                "context_retrieval_calls": self._context_retrieval_calls,
+                "context_retrieval_errors": self._context_retrieval_errors,
+                "context_retrieved_chunks": self._context_retrieved_chunks,
+                "context_retrieved_tokens": self._context_retrieved_tokens,
+                "context_retrieval_ms": self._context_retrieval_ms,
+                "context_index_calls": self._context_index_calls,
+                "context_index_errors": self._context_index_errors,
+                "context_indexed_documents": self._context_indexed_documents,
+                "context_indexed_nodes": self._context_indexed_nodes,
+                "context_index_skipped_documents": (
+                    self._context_index_skipped_documents
+                ),
+                "context_index_ms": self._context_index_ms,
                 "sources": self._sources,
             },
             "context": self._context,
-            "timeline": self._timeline,
+            "timeline": timeline,
             "evaluation": None,
         }
 

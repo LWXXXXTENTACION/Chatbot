@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from langchain_core.messages import (
+    AIMessage,
     BaseMessage,
     HumanMessage,
     RemoveMessage,
@@ -36,7 +37,13 @@ from app.config import (
 from app.graph.context_window import estimate_tokens, split_complete_turns
 from app.graph.events import emit
 from app.graph.model import message_text
-from app.graph.state import AgentState, ContextReport, ContextStrategy
+from app.graph.state import (
+    AgentState,
+    ContextArchiveRef,
+    ContextReport,
+    ContextStrategy,
+    RetrievedContextItem,
+)
 from app.llm.client import create_deepseek_chat
 
 logger = logging.getLogger("chatbot.graph.context_manager")
@@ -251,13 +258,53 @@ async def summarize_context(
         return fallback
 
 
-def _context_tokens(messages: list[BaseMessage], summary: str, memory: str) -> int:
+def _retrieved_messages(items: list[RetrievedContextItem]) -> list[BaseMessage]:
+    return [
+        SystemMessage(content=(
+            "语义索引召回的不可信历史数据：\n" + item.get("text", "")
+        ))
+        for item in items
+        if item.get("text", "").strip()
+    ]
+
+
+def _context_tokens(
+    messages: list[BaseMessage],
+    summary: str,
+    memory: str,
+    retrieved: list[RetrievedContextItem],
+) -> int:
     context_documents: list[BaseMessage] = []
     if summary:
         context_documents.append(SystemMessage(content=f"历史摘要：\n{summary}"))
     if memory:
         context_documents.append(SystemMessage(content=f"会话记忆：\n{memory}"))
-    return estimate_tokens([*context_documents, *messages])
+    return estimate_tokens([
+        *context_documents,
+        *_retrieved_messages(retrieved),
+        *messages,
+    ])
+
+
+def _archive_refs(messages: list[BaseMessage]) -> list[ContextArchiveRef]:
+    """只为完整 Human→AI turn 生成范围引用，当前未完成 turn 不会入队。"""
+    _prefix, turns = split_complete_turns(messages)
+    refs: list[ContextArchiveRef] = []
+    for turn in turns:
+        first = next(
+            (message for message in turn if isinstance(message, HumanMessage)),
+            None,
+        )
+        last = next(
+            (message for message in reversed(turn) if isinstance(message, AIMessage)),
+            None,
+        )
+        if first is not None and last is not None and first.id and last.id:
+            refs.append({
+                "start_message_id": str(first.id),
+                "end_message_id": str(last.id),
+            })
+    return refs
 
 
 def _remove_messages(
@@ -284,9 +331,12 @@ async def manage_context(
     summary = state.get("context_summary", "")
     memory = state.get("session_memory", "")
     memory_cursor = state.get("session_memory_cursor", "")
-    tokens_before = _context_tokens(original, summary, memory)
+    retrieved = list(state.get("retrieved_context", []))
+    retrieved_tokens = estimate_tokens(_retrieved_messages(retrieved))
+    tokens_before = _context_tokens(original, summary, memory, retrieved)
     strategies: list[ContextStrategy] = []
     removed_ids: set[str] = set()
+    archive_queue: list[ContextArchiveRef] = []
 
     working, compacted = _microcompact_tools(
         original,
@@ -301,7 +351,10 @@ async def manage_context(
     keep_count = min(effective_policy.keep_recent_turns, len(turns))
     eligible_turns = turns[:-keep_count] if keep_count else turns
     eligible = [*prefix, *(message for turn in eligible_turns for message in turn)]
-    pressure = _context_tokens(working, summary, memory) / effective_policy.max_tokens
+    pressure = (
+        _context_tokens(working, summary, memory, retrieved)
+        / effective_policy.max_tokens
+    )
     wants_full = pressure >= effective_policy.full_compact_ratio and bool(eligible)
     wants_collapse = (
         pressure >= effective_policy.collapse_ratio
@@ -346,24 +399,31 @@ async def manage_context(
             strategies.append("session_memory")
         if collapse_targets:
             summary = generated_summary or summary
+            archive_queue.extend(_archive_refs(collapse_targets))
             working = _remove_messages(working, collapse_targets, removed_ids)
             strategies.append("full_compact" if wants_full else "context_collapse")
 
     # PTL 是最后一道确定性保护：只删除最早的完整 turn，绝不删除当前 turn，
     # 也绝不把一次 AI tool_call 和它的 ToolMessage 拆开。
     while (
-        _context_tokens(working, summary, memory) / effective_policy.max_tokens
+        _context_tokens(working, summary, memory, retrieved)
+        / effective_policy.max_tokens
         >= effective_policy.ptl_truncation_ratio
     ):
         current_prefix, current_turns = split_complete_turns(working)
         if len(current_turns) <= 1:
             break
         oldest_group = [*current_prefix, *current_turns[0]]
+        archive_queue.extend(_archive_refs(oldest_group))
         working = _remove_messages(working, oldest_group, removed_ids)
         if "ptl_truncation" not in strategies:
             strategies.append("ptl_truncation")
 
-    tokens_after = _context_tokens(working, summary, memory)
+    tokens_after = _context_tokens(working, summary, memory, retrieved)
+    unique_archive_refs = list({
+        (ref["start_message_id"], ref["end_message_id"]): ref
+        for ref in archive_queue
+    }.values())
     strategies = [strategy for strategy in STRATEGY_ORDER if strategy in strategies]
     report: ContextReport = {
         "strategies": strategies,
@@ -374,6 +434,7 @@ async def manage_context(
         "pressure_after": round(tokens_after / effective_policy.max_tokens, 4),
         "compacted_tool_results": len(compacted),
         "removed_messages": len(removed_ids),
+        "retrieved_context_tokens": retrieved_tokens,
         "overflowed": tokens_after > effective_policy.max_tokens,
     }
     await emit(writer, {
@@ -386,6 +447,7 @@ async def manage_context(
         "pressureAfter": report["pressure_after"],
         "compactedToolResults": len(compacted),
         "removedMessages": len(removed_ids),
+        "retrievedContextTokens": retrieved_tokens,
         "overflowed": report["overflowed"],
     })
     message_updates: list[BaseMessage] = [
@@ -403,6 +465,7 @@ async def manage_context(
         "session_memory": memory,
         "session_memory_cursor": memory_cursor,
         "context_report": report,
+        "context_archive_queue": unique_archive_refs,
     }
 
 

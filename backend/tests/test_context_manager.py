@@ -27,6 +27,8 @@ def state(messages, **overrides):
         "session_memory": "",
         "session_memory_cursor": "",
         "context_report": None,
+        "retrieved_context": [],
+        "context_archive_queue": [],
         "error": None,
     }
     value.update(overrides)
@@ -113,6 +115,10 @@ def test_context_collapse_updates_summary_and_session_memory(monkeypatch):
         "session_memory",
     ]
     assert any(isinstance(message, RemoveMessage) for message in update["messages"])
+    assert update["context_archive_queue"] == [{
+        "start_message_id": "h-0",
+        "end_message_id": "a-0",
+    }]
     assert events[0]["type"] == "context_status"
 
 
@@ -147,6 +153,10 @@ def test_full_compact_then_ptl_keeps_latest_complete_turn(monkeypatch):
         "session_memory",
         "full_compact",
         "ptl_truncation",
+    ]
+    assert update["context_archive_queue"] == [
+        {"start_message_id": f"h-{index}", "end_message_id": f"a-{index}"}
+        for index in range(3)
     ]
     reduced = add_messages(messages, update["messages"])
     assert [(message.type, message.id) for message in reduced] == [

@@ -333,7 +333,7 @@ sequenceDiagram
 
 | 痛点 | 根因 | 解决方案 |
 |---|---|---|
-| 1. 卡顿：逐字渲染卡死浏览器 | 每个 token 都拼接整段字符串、触发 React state 和 Markdown 重解析 | `FrameDeltaBuffer` 使用写指针/发布指针无损累积，网络 append 为 O(1)；`requestAnimationFrame` 每个绘制帧最多提交一次，隐藏标签页用 timeout 兜底 |
+| 1. 卡顿：逐字渲染卡死浏览器 | 每个 token 都拼接整段字符串、触发 React state 和 Markdown 重解析 | `FrameDeltaBuffer` 使用写指针/发布指针无损累积，网络 append 为 O(1)；`requestAnimationFrame` 每个绘制帧最多提交一次；普通文本保持打字机式增长，只有未闭合表格、代码围栏、链接等尾部暂用稳定占位 |
 | 2. 断流：重连后内容丢失或重复 | `reader.read()` 半开、HTTP 连接与生成任务耦合、重连重新执行请求 | 前端手动指数退避重连，携带同一 `streamId + Last-Event-ID`；后端 producer 与 HTTP subscriber 解耦，只从 SSE Journal 回放游标后的事件 |
 | 3. 错乱/乱码：TCP 拆包后 JSON 解析失败 | TCP chunk 不等于 SSE event，UTF-8 多字节字符、SSE frame、JSON 甚至 JS 代理对都可能跨 chunk | `TextDecoder(stream=true)` 保留半个 UTF-8 字符，`SSEFrameParser` 先 Buffer 累积再按空行分隔符拆帧，完整 `data:` 才 JSON.parse；双缓冲暂存尾部高代理，避免短暂显示 `�` |
 

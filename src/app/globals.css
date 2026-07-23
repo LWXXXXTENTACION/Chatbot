@@ -242,6 +242,43 @@ body {
   color: var(--fg);
 }
 
+.streaming-markdown-pending {
+  display: flex;
+  width: min(100%, 18rem);
+  flex-direction: column;
+  gap: 0.42rem;
+  margin-block: 0.4rem 0.15rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--bg-subtle) 78%, transparent);
+}
+
+.streaming-markdown-pending-line {
+  height: 0.42rem;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--fg-subtle) 18%, transparent);
+}
+
+.streaming-markdown-pending-line:first-of-type { width: 86%; }
+.streaming-markdown-pending-line:last-of-type { width: 58%; }
+
+.streaming-markdown-caret {
+  display: inline-block;
+  width: 0.42rem;
+  height: 1em;
+  margin-left: 0.12rem;
+  border-radius: 1px;
+  background: var(--accent);
+  vertical-align: -0.12em;
+  animation: markdown-caret-blink 0.82s steps(1, end) infinite;
+}
+
+@keyframes markdown-caret-blink {
+  0%, 46% { opacity: 1; }
+  47%, 100% { opacity: 0; }
+}
+
 /* Browser equivalent of a retained screen region: off-screen messages keep
    an intrinsic size and skip layout/paint until they approach the viewport. */
 .message-frame {
@@ -422,6 +459,7 @@ body {
   .observability-reveal,
   .fade-in-up,
   .shimmer-text,
+  .streaming-markdown-caret,
   .typing-dot {
     animation: none !important;
   }

@@ -12,11 +12,14 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { CodeBlock } from "./CodeBlock";
 import type { Source } from "@/lib/types";
+import {
+  projectStreamingMarkdown,
+  type PendingMarkdownKind,
+} from "@/lib/streaming-markdown";
 
 /**
- * Markdown 采用“完成后再解析”策略：流式阶段只显示稳定骨架，不把尚未闭合的
- * 代码围栏、表格或链接交给解析器；done 后一次性渲染完整 AST，从源头避免布局
- * 来回跳动和 Markdown 源码短暂裸露。
+ * Markdown 采用“普通文本逐帧、未闭合结构占位”的策略：打字机效果不会丢失，
+ * 代码围栏、表格、链接等半成品也不会以 Markdown 源码形式短暂裸露。
  */
 
 /** 递归提取 hast 文本，供代码块复制按钮使用。 */
@@ -192,7 +195,7 @@ function MarkdownImpl({
   return (
     <div className={`markdown ${streaming ? "markdown-streaming" : ""}`}>
       {streaming ? (
-        <StreamingMarkdownPlaceholder />
+        <StreamingMarkdown text={children} sources={sources} />
       ) : (
         <CompletedMarkdown text={children} sources={sources} />
       )}
@@ -200,20 +203,55 @@ function MarkdownImpl({
   );
 }
 
-function StreamingMarkdownPlaceholder() {
-  // 固定高度的中性占位不会随半截 Markdown 结构变化，减少消息区重排。
+const PENDING_LABELS: Record<PendingMarkdownKind, string> = {
+  "code-block": "正在接收代码块",
+  table: "正在接收表格结构",
+  "table-row": "正在接收表格行",
+  link: "正在接收链接",
+  "inline-code": "正在接收行内代码",
+  emphasis: "正在接收格式化文本",
+  marker: "正在接收 Markdown 结构",
+};
+
+function StreamingMarkdownPlaceholder({
+  kind,
+}: {
+  kind: PendingMarkdownKind;
+}) {
+  // 占位符只对应当前未闭合结构；已经稳定的普通正文仍在上方逐帧增长。
   return (
     <div
-      className="space-y-2.5 py-1"
+      className="streaming-markdown-pending"
       data-streaming-markdown-placeholder
       role="status"
-      aria-label="正在接收完整回复"
+      aria-label={PENDING_LABELS[kind]}
     >
-      <span className="sr-only">正在接收完整回复，完成后显示格式化内容</span>
-      <div className="h-2.5 w-[92%] rounded-full bg-[var(--bg-subtle)]" />
-      <div className="h-2.5 w-[76%] rounded-full bg-[var(--bg-subtle)]" />
-      <div className="h-2.5 w-[58%] rounded-full bg-[var(--bg-subtle)]" />
+      <span className="sr-only">{PENDING_LABELS[kind]}</span>
+      <span className="streaming-markdown-pending-line" />
+      <span className="streaming-markdown-pending-line" />
     </div>
+  );
+}
+
+function StreamingMarkdown({ text, sources }: { text: string; sources: Source[] }) {
+  const projection = useMemo(() => projectStreamingMarkdown(text), [text]);
+  const processedText = useMemo(
+    () => sources.length
+      ? citationMarkdown(projection.visibleText, sources)
+      : projection.visibleText,
+    [projection.visibleText, sources],
+  );
+
+  return (
+    <>
+      {processedText ? (
+        <MarkdownDocument text={processedText} sources={sources} highlight={false} />
+      ) : null}
+      {projection.pendingKind ? (
+        <StreamingMarkdownPlaceholder kind={projection.pendingKind} />
+      ) : null}
+      <span className="streaming-markdown-caret" aria-hidden="true" />
+    </>
   );
 }
 
@@ -228,7 +266,6 @@ function CompletedMarkdown({ text, sources }: { text: string; sources: Source[] 
 export const Markdown = memo(
   MarkdownImpl,
   (previous, next) => {
-    if (previous.streaming && next.streaming) return true;
     return previous.children === next.children
       && previous.streaming === next.streaming
       && sameSources(previous.sources, next.sources);

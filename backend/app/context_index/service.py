@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -43,7 +44,13 @@ def stable_document_id(
 
 
 def stable_node_id(document_id: str, chunk_index: int, index_version: str) -> str:
-    return _digest(document_id, str(chunk_index), index_version)
+    """生成 Qdrant 可接受的确定性 UUID。
+
+    本地 Qdrant 的 point id 只能是整数或标准 UUID，不能直接使用 64 位 SHA-256。
+    UUIDv5 同样由稳定输入决定：重复构建会得到同一个 ID，同时保留版本隔离。
+    """
+    identity = "\x1f".join((document_id, str(chunk_index), index_version))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
 
 
 @dataclass(frozen=True, slots=True)

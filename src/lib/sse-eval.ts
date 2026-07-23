@@ -10,6 +10,7 @@ import {
   type StorageLike,
 } from "./sse-session.ts";
 import { latestArtifactFromMessages } from "./artifacts.ts";
+import { projectStreamingMarkdown } from "./streaming-markdown.ts";
 import type { ChatUIMessage, TextPart } from "./types.ts";
 
 /**
@@ -52,6 +53,7 @@ export interface SSEPerformanceEvalResult {
     sessionPersistencePass: boolean;
     unicodeBufferPass: boolean;
     streamingTextIntegrityPass: boolean;
+    streamingMarkdownProjectionPass: boolean;
     duplicateReplayPass: boolean;
     artifactRestorePass: boolean;
   };
@@ -365,7 +367,7 @@ function evaluateUnicodeBuffer(): boolean {
     && !secondPaint.includes("\uFFFD");
 }
 
-/** Streaming view receives the exact raw text; Markdown runs only at done. */
+/** 双指针必须始终保留完整原文，显示层的 Markdown 投影不能修改传输数据。 */
 function evaluateStreamingTextIntegrity(): boolean {
   const expected = "# 标题\n\n```ts\nconst 文本 = \"你好 😀\";\n```";
   const chunks = ["# 标", "题\n\n`", "``ts\nconst 文", "本 = \"你好 ", "😀\";\n```"];
@@ -375,6 +377,54 @@ function evaluateStreamingTextIntegrity(): boolean {
     buffer.flush();
   }
   return buffer.flush(true) === expected;
+}
+
+/** 普通文本逐帧显示，只有未闭合 Markdown 尾部被占位。 */
+function evaluateStreamingMarkdownProjection(): boolean {
+  const plain = projectStreamingMarkdown("普通文本正在逐步生成");
+  const openStrong = projectStreamingMarkdown("普通文本 **尚未闭合");
+  const closedStrong = projectStreamingMarkdown("普通文本 **已经闭合**");
+  const openLink = projectStreamingMarkdown("参考 [来源](https://example.com");
+  const closedLink = projectStreamingMarkdown(
+    "参考 [来源](https://example.com)",
+  );
+  const tableHeader = projectStreamingMarkdown(
+    "前言\n\n| 名称 | 说明 |\n",
+  );
+  const tableReady = projectStreamingMarkdown(
+    "前言\n\n| 名称 | 说明 |\n| --- | --- |",
+  );
+  const partialRow = projectStreamingMarkdown(
+    "前言\n\n| 名称 | 说明 |\n| --- | --- |\n| Transformer | 注意力",
+  );
+  const closedRow = projectStreamingMarkdown(
+    "前言\n\n| 名称 | 说明 |\n| --- | --- |\n| Transformer | 注意力 |\n",
+  );
+  const openFence = projectStreamingMarkdown(
+    "正文\n\n```ts\nconst value = 1;",
+  );
+  const closedFence = projectStreamingMarkdown(
+    "正文\n\n```ts\nconst value = 1;\n```",
+  );
+
+  return plain.visibleText === "普通文本正在逐步生成"
+    && plain.pendingKind === null
+    && openStrong.visibleText === "普通文本"
+    && openStrong.pendingKind === "emphasis"
+    && closedStrong.visibleText.endsWith("**已经闭合**")
+    && closedStrong.pendingKind === null
+    && openLink.visibleText === "参考"
+    && openLink.pendingKind === "link"
+    && closedLink.pendingKind === null
+    && tableHeader.visibleText === "前言"
+    && tableHeader.pendingKind === "table"
+    && tableReady.pendingKind === null
+    && partialRow.visibleText.endsWith("| --- | --- |")
+    && partialRow.pendingKind === "table-row"
+    && closedRow.pendingKind === null
+    && openFence.visibleText === "正文"
+    && openFence.pendingKind === "code-block"
+    && closedFence.pendingKind === null;
 }
 
 /** Multiple subscribers/replays must never append an applied event twice. */
@@ -450,6 +500,7 @@ export async function runSSEPerformanceEval(
   const sessionPersistencePass = evaluateSessionPersistence();
   const unicodeBufferPass = evaluateUnicodeBuffer();
   const streamingTextIntegrityPass = evaluateStreamingTextIntegrity();
+  const streamingMarkdownProjectionPass = evaluateStreamingMarkdownProjection();
   const duplicateReplayPass = evaluateDuplicateReplay();
   const artifactRestorePass = evaluateArtifactRestore();
 
@@ -478,6 +529,7 @@ export async function runSSEPerformanceEval(
       sessionPersistencePass,
       unicodeBufferPass,
       streamingTextIntegrityPass,
+      streamingMarkdownProjectionPass,
       duplicateReplayPass,
       artifactRestorePass,
     },

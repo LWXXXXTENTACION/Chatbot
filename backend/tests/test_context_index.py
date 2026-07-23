@@ -1,6 +1,7 @@
 """语义索引只保存安全历史，并以显式 LangGraph 节点 fail-open。"""
 
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -36,7 +37,10 @@ def test_stable_ids_and_safe_archive_rendering():
     first = stable_document_id("u", "c", "h", "a")
     assert first == stable_document_id("u", "c", "h", "a")
     assert first != stable_document_id("other", "c", "h", "a")
-    assert stable_node_id(first, 0, "v1") != stable_node_id(first, 1, "v1")
+    first_node = stable_node_id(first, 0, "v1")
+    assert first_node == stable_node_id(first, 0, "v1")
+    assert first_node != stable_node_id(first, 1, "v1")
+    assert str(UUID(first_node)) == first_node
 
     user = Message(id="h", conversation_id="c", role="user", sequence=1)
     user.parts = [MessagePart(type="text", text="请生成风险报告", position=0)]

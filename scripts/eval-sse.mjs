@@ -25,6 +25,7 @@ if (
   || !result.robustness.sessionPersistencePass
   || !result.robustness.unicodeBufferPass
   || !result.robustness.streamingTextIntegrityPass
+  || !result.robustness.streamingMarkdownProjectionPass
   || !result.robustness.duplicateReplayPass
   || !result.robustness.artifactRestorePass
   || result.comparison.publicationReductionPct < 95

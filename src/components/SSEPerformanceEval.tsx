@@ -92,6 +92,7 @@ export function SSEPerformanceEval() {
       && result.robustness.sessionPersistencePass
       && result.robustness.unicodeBufferPass
       && result.robustness.streamingTextIntegrityPass
+      && result.robustness.streamingMarkdownProjectionPass
       && result.robustness.duplicateReplayPass
       && result.robustness.artifactRestorePass
       && result.comparison.publicationReductionPct >= 95,
@@ -199,7 +200,8 @@ export function SSEPerformanceEval() {
                   ["后台标签页兜底提交", result.robustness.schedulerPass, "rAF + timer"],
                   ["刷新续传持久化", result.robustness.sessionPersistencePass, "cursor + draft"],
                   ["Unicode 码点完整", result.robustness.unicodeBufferPass, "surrogate-safe"],
-                  ["流式文本原样输出", result.robustness.streamingTextIntegrityPass, "plain text → Markdown on done"],
+                  ["流式原文完整", result.robustness.streamingTextIntegrityPass, "transport buffer remains lossless"],
+                  ["Markdown 稳定投影", result.robustness.streamingMarkdownProjectionPass, "plain text streams; open syntax waits"],
                   ["重复订阅事件去重", result.robustness.duplicateReplayPass, "shared cursor → exactly once"],
                   ["Artifact 刷新恢复", result.robustness.artifactRestorePass, "persisted tool part → panel"],
                 ].map(([label, ok, detail]) => (
